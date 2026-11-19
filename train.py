@@ -11,9 +11,12 @@ from data import get_batch, load_meta, load_split, load_tokenizer
 from model import GPT, GPTConfig
 
 p = argparse.ArgumentParser()
+CHOICES = {"norm": ["layernorm", "rmsnorm"], "mlp": ["gelu", "swiglu"], "pos": ["learned", "rope"]}
 for f in fields(GPTConfig):
     if f.name != "vocab_size":
-        p.add_argument(f"--{f.name}", type=f.type, default=f.default)
+        # bool("false") is True, so parse booleans explicitly
+        typ = (lambda s: s.lower() in ("1", "true", "yes")) if f.type is bool else f.type
+        p.add_argument(f"--{f.name}", type=typ, default=f.default, choices=CHOICES.get(f.name))
 p.add_argument("--batch_size", type=int, default=64)
 p.add_argument("--steps", type=int, default=5000)
 p.add_argument("--lr", type=float, default=1e-3, help="peak learning rate, reached after warmup")
