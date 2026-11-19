@@ -193,6 +193,16 @@ class GPT(nn.Module):
         model.load_state_dict(ckpt["model"])
         return model.eval(), ckpt
 
+    def grow_vocab(self, n_new):
+        """Append n_new token rows (e.g. new special tokens), initialised to the mean embedding so they start as
+        a 'typical' token. Existing tokens' logits are unchanged; the head stays tied to the embedding."""
+        old = self.tok_emb.weight.data
+        new = torch.cat([old, old.mean(0, keepdim=True).expand(n_new, -1)])
+        self.tok_emb = nn.Embedding.from_pretrained(new.clone(), freeze=False)
+        self.lm_head = nn.Linear(self.cfg.n_embd, new.size(0), bias=False, device=new.device)
+        self.lm_head.weight = self.tok_emb.weight
+        self.cfg.vocab_size += n_new
+
     def num_params(self):
         return sum(p.numel() for p in self.parameters())  # tied weights counted once
 

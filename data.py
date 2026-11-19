@@ -9,6 +9,8 @@ import json
 import os
 import time
 import urllib.request
+from itertools import chain
+from multiprocessing import Pool
 
 import numpy as np
 import torch
@@ -48,63 +50,117 @@ def download(url, path, max_bytes=None):
     os.replace(path + ".tmp", path)
 
 
-def load_text(dataset, train_mb):
-    """Returns {"train": str, "val": str}."""
+def _text_pieces(text, piece_chars=1 << 20):
+    """Cut an in-memory string into ~piece_chars pieces at newlines."""
+    start = 0
+    while start < len(text):
+        end = text.find("\n", start + piece_chars)
+        end = len(text) if end == -1 else end + 1
+        yield text[start:end]
+        start = end
+
+
+def _story_pieces(path, piece_chars=1 << 20):
+    """Stream whole stories from a TinyStories file in ~piece_chars pieces, without loading the file: skip text
+    before the first separator and after the last (a byte-range download cuts stories at both ends). Pieces end
+    right after an EOT, which the tokenizer splits out first, so the cuts never change the tokenization."""
+    with open(path, encoding="utf-8", errors="ignore") as f:  # a byte-range cut can split a UTF-8 char
+        buf, started = "", False
+        while chunk := f.read(piece_chars):
+            buf += chunk
+            if not started:
+                i = buf.find(EOT)
+                if i == -1:
+                    continue
+                buf, started = buf[i + len(EOT) :].lstrip("\n"), True
+            cut = buf.rfind(EOT)
+            if cut != -1:
+                cut += len(EOT)
+                yield buf[:cut]
+                buf = buf[cut:]
+        # whatever is left after the last EOT is a partial story: dropped
+
+
+def split_sources(dataset, train_mb):
+    """{split: zero-arg callable returning an iterator of text pieces}; nothing large is held in memory."""
     os.makedirs(DATA_DIR, exist_ok=True)
     if dataset == "shakespeare":
         raw = os.path.join(DATA_DIR, "input.txt")
         download(SHAKESPEARE_URL, raw)
         text = open(raw, encoding="utf-8").read()
         n = int(0.9 * len(text))
-        return {"train": text[:n], "val": text[n:]}
-    splits = {}
+        return {"train": lambda: _text_pieces(text[:n]), "val": lambda: _text_pieces(text[n:])}
+    sources = {}
     for split, remote, max_bytes in [("train", "train", train_mb * 10**6), ("val", "valid", None)]:
         raw = os.path.join(DATA_DIR, f"tinystories_{split}{f'_{train_mb}mb' if max_bytes else ''}.txt")
         download(TINYSTORIES_URL.format(remote), raw, max_bytes)
-        text = open(raw, encoding="utf-8", errors="ignore").read()  # a byte-range cut can split a UTF-8 char
-        # Keep whole stories only: drop text before the first and after the last separator.
-        splits[split] = text[text.index(EOT) + len(EOT) : text.rindex(EOT) + len(EOT)].lstrip("\n")
-    return splits
+        sources[split] = lambda raw=raw: _story_pieces(raw)
+    return sources
 
 
-def encode_to_file(tok, text, path, piece_chars=1 << 20):
-    """Encode in ~1M-char pieces cut at newlines, so a 400MB split never becomes one huge Python list."""
-    n_tokens = 0
-    with open(path, "wb") as f:
-        start = 0
-        while start < len(text):
-            end = text.find("\n", start + piece_chars)
-            end = len(text) if end == -1 else end + 1
-            ids = np.array(tok.encode(text[start:end]), dtype=np.uint16)
-            ids.tofile(f)
-            n_tokens += len(ids)
-            start = end
-    return n_tokens
+_worker_tok = None
+
+
+def _init_worker(tok):
+    global _worker_tok
+    _worker_tok = tok
+
+
+def _encode_piece(piece):
+    ids = np.array(_worker_tok.encode(piece), dtype=np.uint16)
+    return ids, len(piece.replace(EOT, "").encode("utf-8"))  # bits/byte counts real text only
+
+
+def encode_to_file(tok, pieces, path, in_flight=32):
+    """Encode pieces on all CPU cores and append them to path in order. At most `in_flight` pieces are queued at
+    a time (Pool.imap alone would read the whole input ahead), so memory stays flat for multi-GB splits.
+    Returns (tokens, bytes)."""
+    n_tokens = n_bytes = 0
+    with open(path, "wb") as f, Pool(os.cpu_count(), initializer=_init_worker, initargs=(tok,)) as pool:
+        batch = []
+        for piece in chain(pieces, [None]):  # lazy; None marks the end so the last partial batch is flushed
+            if piece is not None:
+                batch.append(piece)
+            if len(batch) == in_flight or (piece is None and batch):
+                for ids, nb in pool.imap(_encode_piece, batch):
+                    ids.tofile(f)
+                    n_tokens, n_bytes = n_tokens + len(ids), n_bytes + nb
+                batch = []
+    return n_tokens, n_bytes
 
 
 def prepare(dataset="shakespeare", tokenizer="char", vocab_size=1024, train_mb=400, bpe_train_mb=50):
-    splits = load_text(dataset, train_mb)
+    sources = split_sources(dataset, train_mb)
     t0 = time.time()
     prefix = "" if dataset == "shakespeare" else f"{dataset}_"
     if tokenizer == "char":
-        tok = CharTokenizer("".join(sorted(set(splits["train"]) | set(splits["val"]))))
+        chars = set()
+        for src in sources.values():
+            for piece in src():
+                chars |= set(piece)
+        tok = CharTokenizer("".join(sorted(chars)))
         meta, out = {"type": "char", "chars": tok.chars}, os.path.join(DATA_DIR, f"{prefix}char")
     else:
         specials = [EOT] if dataset == "tinystories" else []
-        # Merges are learned from (a prefix of) the train split only: no val leakage.
-        tok = BPETokenizer.train(splits["train"][: bpe_train_mb * 10**6], vocab_size, specials, verbose=True)
+        bpe_text, n = [], 0
+        for piece in sources["train"]():  # merges are learned from a train prefix only: no val leakage
+            bpe_text.append(piece)
+            n += len(piece)
+            if n >= bpe_train_mb * 10**6:
+                break
+        tok = BPETokenizer.train("".join(bpe_text)[: bpe_train_mb * 10**6], vocab_size, specials, verbose=True)
+        del bpe_text
         print(f"learned {len(tok.merge_list)} merges in {time.time() - t0:.0f}s")
         meta = {"type": "bpe", "merges": tok.merge_list, "special_tokens": specials}
-        out = os.path.join(DATA_DIR, f"{prefix}bpe{vocab_size}")
+        size = f"_{train_mb}mb" if dataset == "tinystories" and train_mb != 400 else ""  # 400 MB: original dir name
+        out = os.path.join(DATA_DIR, f"{prefix}bpe{vocab_size}{size}")
     assert tok.vocab_size <= 2**16, "token ids are stored as uint16"
     os.makedirs(out, exist_ok=True)
 
-    for split, s in splits.items():
-        path = os.path.join(out, f"{split}.bin")
-        meta[f"{split}_tokens"] = encode_to_file(tok, s, path)
-        meta[f"{split}_bytes"] = len(s.replace(EOT, "").encode("utf-8"))  # bits/byte counts real text only
+    for split, src in sources.items():
+        meta[f"{split}_tokens"], meta[f"{split}_bytes"] = encode_to_file(tok, src(), os.path.join(out, f"{split}.bin"))
     val_ids = np.fromfile(os.path.join(out, "val.bin"), dtype=np.uint16).tolist()
-    assert tok.decode(val_ids) == splits["val"], "val split does not round-trip"
+    assert tok.decode(val_ids) == "".join(sources["val"]()), "val split does not round-trip"
     with open(os.path.join(out, "meta.json"), "w") as f:
         json.dump(meta, f)
     print(f"{out}: vocab {tok.vocab_size}, train {meta['train_tokens']:,} / val {meta['val_tokens']:,} tokens, "
@@ -116,11 +172,12 @@ def load_meta(data_dir):
         return json.load(f)
 
 
-def load_tokenizer(data_dir):
+def load_tokenizer(data_dir, extra_special_tokens=()):
+    """extra_special_tokens: added after fine-tuning (e.g. chat roles); they get the next ids."""
     meta = load_meta(data_dir)
     if meta["type"] == "char":
         return CharTokenizer(meta["chars"])
-    return BPETokenizer(meta["merges"], meta.get("special_tokens", []))
+    return BPETokenizer(meta["merges"], meta.get("special_tokens", []) + list(extra_special_tokens))
 
 
 def load_split(data_dir, split):

@@ -4,6 +4,7 @@ python analysis.py --ckpt runs/ts_llama/ckpt.pt     # writes assets/analysis/{at
 """
 import argparse
 import os
+import re
 
 import numpy as np
 import torch
@@ -34,9 +35,9 @@ def induction_scores(model, vocab_lo, vocab_hi, seq_len=50, batch=16, seed=0):
     Score = mean attention on exactly that position. Also returns loss on each half: copying makes half 2 easy."""
     g = torch.Generator().manual_seed(seed)
     rand = torch.randint(vocab_lo, vocab_hi, (batch, seq_len), generator=g)
-    idx = torch.cat([rand, rand], dim=1)
+    idx = torch.cat([rand, rand], dim=1).to(next(model.parameters()).device)
     logits, w = record_attention(model, idx)
-    q = torch.arange(seq_len, 2 * seq_len)  # query positions in the repeat
+    q = torch.arange(seq_len, 2 * seq_len, device=idx.device)  # query positions in the repeat
     scores = w[:, :, :, q, q - seq_len + 1].mean(dim=(0, 3))  # (n_layer, n_head)
     prev = w[:, :, :, q, q - 1].mean(dim=(0, 3))  # previous-token heads: the other half of an induction circuit
     loss = F.cross_entropy(logits[:, :-1].transpose(1, 2), idx[:, 1:], reduction="none")
@@ -52,11 +53,30 @@ def single_token_ids(tok, words):
     return ids
 
 
+def plot_induction_training(logs, plt):
+    """Induction score, previous-token score and repeat gain over training, from train.py --induction logs."""
+    pat = re.compile(r"^step +(\d+) .*\| induct ([\d.]+) \| prev ([\d.]+) \| repeat gain (-?[\d.]+)")
+    fig, axes = plt.subplots(1, 3, figsize=(14, 3.8))
+    for log in logs:
+        rows = np.array([[float(x) for x in m.groups()] for m in map(pat.match, open(log)) if m])
+        label = os.path.basename(log).removesuffix(".log")
+        for ax, col in zip(axes, (1, 2, 3)):
+            ax.plot(rows[:, 0], rows[:, col], label=label)
+    for ax, title in zip(axes, ("best induction score", "best previous-token score", "repeat gain (loss drop, nats)")):
+        ax.set(title=title, xlabel="step")
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(f"{OUT}/induction_training.png", dpi=130)
+    print(f"wrote {OUT}/induction_training.png")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", default="runs/ts_llama/ckpt.pt")
     p.add_argument("--prompt", default="Once upon a time, there was a girl named Lily. Lily had a red ball. "
                                        "One day, Lily lost her red ball. Lily looked for her red")
+    p.add_argument("--induction_logs", nargs="+", help="only plot induction scores over training from these logs")
     args = p.parse_args()
 
     import matplotlib
@@ -64,6 +84,8 @@ def main():
     import matplotlib.pyplot as plt
 
     os.makedirs(OUT, exist_ok=True)
+    if args.induction_logs:
+        return plot_induction_training(args.induction_logs, plt)
     model, ckpt = GPT.from_checkpoint(args.ckpt, "cpu")
     tok = load_tokenizer(ckpt["args"]["data"])
     cfg = model.cfg

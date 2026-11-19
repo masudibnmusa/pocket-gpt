@@ -26,6 +26,9 @@ p.add_argument("--grad_clip", type=float, default=1.0, help="max global grad nor
 p.add_argument("--weight_decay", type=float, default=0.1, help="applied to matmul weights and embeddings only")
 p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16", help="autocast dtype for forward passes (CUDA only)")
 p.add_argument("--compile", action="store_true", help="torch.compile the model (~1 min warmup, faster steps)")
+p.add_argument("--induction", action="store_true", help="log induction / previous-token head scores at each eval")
+p.add_argument("--repeat_frac", type=float, default=0.0,
+               help="fraction of each batch replaced by random tokens repeated twice (rewards in-context copying)")
 p.add_argument("--eval_interval", type=int, default=250)
 p.add_argument("--eval_iters", type=int, default=100)
 p.add_argument("--data", default="data/char", help="dir made by data.py (train.bin, val.bin, meta.json)")
@@ -66,6 +69,17 @@ autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=devi
 print(f"{model.num_params() / 1e6:.2f}M params on {device} ({args.dtype if device == 'cuda' else 'fp32'}); "
       f"decayed {sum(p.numel() for p in decay):,} / not decayed {sum(p.numel() for p in no_decay):,}; "
       f"expected initial loss ln({cfg.vocab_size}) = {math.log(cfg.vocab_size):.3f}")
+
+
+@torch.no_grad()
+def induction_report():
+    """Best induction / previous-token head score, and how much easier a repeated random sequence gets."""
+    from analysis import induction_scores
+
+    model.eval()
+    ind, prev, first, repeat = induction_scores(model, 256, cfg.vocab_size - 1)
+    model.train()
+    return f" | induct {ind.max():.2f} | prev {prev.max():.2f} | repeat gain {first - repeat:.2f}"
 
 
 @torch.no_grad()
@@ -126,7 +140,8 @@ for step in range(start_step, args.steps + 1):
         losses = estimate_loss()
         print(f"step {step:5d} | train {losses['train']:.4f} | val {losses['val']:.4f} | "
               f"val bpb {val_bits_per_byte(losses['val']):.3f} | "
-              f"lr {lr:.2e} | grad norm {grad_norm.item():.2f} | {tok_s:,.0f} tok/s")
+              f"lr {lr:.2e} | grad norm {grad_norm.item():.2f} | {tok_s:,.0f} tok/s"
+              + (induction_report() if args.induction else ""))
         save(step, rng)
         t0 = time.time()
     if step == args.steps:
@@ -134,6 +149,14 @@ for step in range(start_step, args.steps + 1):
     for g in opt.param_groups:
         g["lr"] = lr
     x, y = get_batch(data["train"], args.batch_size, cfg.block_size, device)
+    if args.repeat_frac > 0:
+        # Random tokens tiled with a random period per row. A fixed period could be solved by a positional
+        # "look exactly P back" head (easy with RoPE); a random period forces content-based induction.
+        k, half = int(args.batch_size * args.repeat_frac), cfg.block_size // 2 + 1
+        seg = torch.randint(256, cfg.vocab_size - 1, (k, half), device=device)  # skip raw bytes and the last (EOT) id
+        period = torch.randint(8, half + 1, (k, 1), device=device)
+        rep = seg.gather(1, torch.arange(cfg.block_size + 1, device=device) % period)
+        x[:k], y[:k] = rep[:, :-1], rep[:, 1:]
     with autocast:
         _, loss = fwd(x, y)
     opt.zero_grad(set_to_none=True)

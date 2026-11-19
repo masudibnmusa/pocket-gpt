@@ -24,7 +24,8 @@ if args.seed is not None:
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model, ckpt = GPT.from_checkpoint(args.ckpt, device)
 
-tok = load_tokenizer(ckpt.get("args", {}).get("data", "data/char"))  # the tokenizer the model was trained with
+ck_args = ckpt.get("args", {})
+tok = load_tokenizer(ck_args.get("data", "data/char"), ck_args.get("extra_special_tokens", []))  # as trained
 idx = torch.tensor([tok.encode(args.prompt)], dtype=torch.long, device=device)
 t0 = time.time()
 out = model.generate(idx, args.tokens, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,

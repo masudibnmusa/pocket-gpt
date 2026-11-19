@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/model-12M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-32_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-34_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. A 12M-parameter model trained for ~10 minutes on one RTX 5060 writes coherent children's stories.
 
@@ -21,13 +21,15 @@ pocket-gpt/
 ├── sample.py            # Generate text from a checkpoint with its own tokenizer (KV cache on by default)
 ├── gpt2.py              # Load OpenAI GPT-2 (124M) weights from Hugging Face into model.GPT
 ├── scaling.py           # Scaling sweep: 5 model sizes, same token budget, power-law fit L(N) = c + a·N^-alpha
-├── analysis.py          # Attention maps, induction / previous-token head scores, embedding neighbours + PCA
-├── finetune.py          # Instruction fine-tuning on TinyStories-Instruct (loss on the story only) + word-following eval
+├── isoflop.py           # Compute-optimal (Chinchilla IsoFLOP) sweep: 3 budgets x 5 sizes, optimal N and D vs compute
+├── analysis.py          # Attention maps, induction / previous-token heads (also over training), embeddings + PCA
+├── finetune.py          # SFT on TinyStories-Instruct: plain-text or chat format (<|user|>/<|assistant|> tokens)
+├── chat.py              # Talk to a chat-tuned model in the terminal
 ├── tests/
 │   ├── test_model.py    # per config (GPT-2/Llama x manual/SDPA): initial loss, no future leak, overfit one batch,
 │   │                    #   manual == SDPA attention, KV cache == full forward, cached == uncached generation, top-p
 │   ├── test_bpe.py      # first merge, unicode round-trip, compression, reload, incremental == naive training, specials
-│   ├── test_finetune.py # instruct parsing, loss mask covers only response tokens
+│   ├── test_finetune.py # instruct parsing, response-only loss mask, chat requests name every word, grow_vocab
 │   └── test_gpt2_parity.py  # our logits == Hugging Face GPT-2 logits (skipped without transformers)
 ├── assets/banners/      # README banners (PNG) + their HTML sources
 ├── assets/analysis/     # plots written by scaling.py and analysis.py
@@ -66,6 +68,15 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python scaling.py                                      # 5 sizes, ~15 min, resumable -> assets/analysis/scaling.png
 .venv/bin/python analysis.py --ckpt runs/ts_llama/ckpt.pt        # attention / induction / embedding plots
 .venv/bin/python finetune.py --base runs/ts_llama/ckpt.pt        # instruction SFT + base-vs-SFT eval, ~5 min
+
+# Full TinyStories (2.2 GB -> 546M tokens, ~35 s on 16 cores, streamed so memory stays flat)
+.venv/bin/python data.py --dataset tinystories --tokenizer bpe --vocab_size 4096 --train_mb 2300
+.venv/bin/python isoflop.py                                      # compute-optimal sweep, ~30 min -> isoflop.png
+.venv/bin/python train.py --data data/tinystories_bpe4096_2300mb --out runs/ts_llama_long --steps 18000 \
+    --n_layer 6 --n_head 6 --n_embd 384 --block_size 256 --warmup 200 --eval_interval 500 --compile --induction \
+    --bias false --norm rmsnorm --mlp swiglu --pos rope          # 295M tokens, ~17 min, logs induction scores
+.venv/bin/python finetune.py --base runs/ts_llama_long/ckpt.pt --out runs/ts_llama_long_chat --chat
+.venv/bin/python chat.py --ckpt runs/ts_llama_long_chat/ckpt.pt
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -151,8 +162,45 @@ clean *previous-token head* (one step off the diagonal).
 **Induction heads** (attend to the token after the previous occurrence of the current token, so a repeated sequence can
 be copied) are tested on a random 50-token sequence repeated twice. Across the sweep, previous-token heads strengthen
 with size (best score 0.32 → 0.68), but induction scores stay small (0.01 → 0.06) and the repeat gets only modestly
-easier (loss −0.65 at 25.7M). The first half of the induction circuit has formed, the copying half barely has: TinyStories
-rarely repeats arbitrary sequences, and 49M tokens is early in training.
+easier (loss −0.65 at 25.7M).
+
+**Do they form with more training?** `train.py --induction` logs the scores at every eval:
+
+| Run | Data | Steps | Best induction score | Repeat gain (nats) |
+|---|---|---|---|---|
+| 12M Llama-style, long run | TinyStories, 295M tokens | 18000 | 0.07 | 0.91 |
+| 2-layer control | TinyStories | 3000 | 0.01 | 0.08 |
+| 2-layer + repeats (`--repeat_frac 0.25`) | TinyStories + 25% random sequences repeated with a random period | 3000 | **0.88** | **8.24** |
+
+![Induction over training](assets/analysis/induction_training.png)
+
+On plain TinyStories, 3x more training only nudges them (repeat gain 0.65 → 0.91; induction score stays ~0.07): the data
+rarely rewards copying arbitrary sequences. When 25% of each batch is random tokens repeated with a random period, the
+same 2-layer model shows the classic **phase change**: nothing for ~1700 steps, then within ~300 steps a previous-token
+head (0.03 → 0.85) and an induction head (0.03 → 0.88) appear together and repeated sequences become almost free to
+predict (loss −8.2 nats). The circuit needs both halves, so neither helps alone and they form at once.
+
+A first version of this control used a fixed repeat period (129 tokens) and showed nothing: with RoPE the model solved it
+with a positional "look exactly 128 back" head that does not transfer to other periods. A random period per row forces
+the content-based mechanism.
+
+## Compute-optimal sweep (Chinchilla)
+`python isoflop.py`: for each compute budget C, every size N trains for exactly D = C/(6N) tokens with its cosine
+schedule matched to that length (14 runs on the full 546M-token TinyStories, ~30 min). A parabola in log N per budget
+gives the loss-minimising size.
+
+| Budget (FLOPs) | Optimal params N | Optimal tokens D | Tokens / param |
+|---|---|---|---|
+| 3e14 | 1.6M | 32M | 21 |
+| 1e15 | 3.1M | 54M | 18 |
+| 3e15 | 5.8M | 86M | 15 |
+
+**N_opt ∝ C^0.57, D_opt ∝ C^0.43**, and ~15–21 tokens per parameter: the Chinchilla result (≈0.5 / 0.5, ≈20 tokens per
+parameter) reproduced at 1/10^8 of its scale. By this measure the 12M models above, trained on 98M tokens (8 tokens/param),
+were undertrained for their size, which the long run confirms (val loss 1.480 → 1.337 with 295M tokens).
+Three budgets give a rough exponent; more budgets would tighten it.
+
+![IsoFLOP curves](assets/analysis/isoflop.png)
 
 ## Instruction fine-tuning
 `python finetune.py --base runs/ts_llama/ckpt.pt` fine-tunes the 12M model on TinyStories-Instruct: a prompt of
@@ -180,5 +228,39 @@ Story:
 
 The fine-tuned model writes a proper story with the hero in it, but misses "decide" and "charming" and ignores the bad ending.
 
+**Better pretraining, better fine-tune.** The same plain SFT on the long-run model (295M tokens instead of 98M) reaches
+story val loss 1.28 (vs 1.42) and uses **59%** of required words (vs 51%).
+
+## Chat fine-tuning
+`finetune.py --chat` adds two special tokens, `<|user|>` and `<|assistant|>`: the embedding table (and the tied output
+head) grows from 4096 to 4098 rows, the new rows starting at the mean embedding so existing logits are unchanged. Each
+example's constraints become a natural request with varied phrasing; the loss covers only the assistant's story:
+
+```text
+<|user|>Tell me a story. It should be about this: [summary] Use the words "tremble", "friend" and "cold". Use some foreshadowing.<|assistant|>[story]<|endoftext|>
+```
+
+`chat.py` encodes the user's text with `encode_ordinary`, so typing `<|assistant|>` can never forge a role token.
+
+```text
+you> Tell me a story about a little dragon who is afraid of the dark.
+model> Once upon a time there was a little dragon who was very frightened. He was scared of the dark [...] One day, the
+dragon decided to be brave. [...] Finally, they found a small cave. The dragon crawled inside and was no longer frightened.
+
+you> Write a short story for kids. Use the words "moon", "boat" and "brave". Include some dialogue.
+model> Once upon a time there was a sailor who loved to go sailing. Every morning the sailor would get out his boat [...]
+he remembered his boat and how he was brave enough to stay in the boat.
+```
+
+| Format (on the long-run model) | Story val loss | Required words used |
+|---|---|---|
+| plain `Words: ... Story:` | 1.28 | 59% |
+| chat request | 1.38 | 37% |
+
+The chat model handles free-form requests (topic, lesson, sad ending) that the plain format cannot express, but follows
+word constraints less reliably: the words are buried in a sentence instead of a dedicated field, the summary is dropped
+from 30% of requests, and the two role tokens start untrained. In the dragon story it kept the topic; in the second it
+used "boat" and "brave" but missed "moon" and the dialogue.
+
 ## Next
-Longer pretraining (to see induction heads form) → compute-optimal sweep (vary tokens as well as parameters) → chat-style SFT with special tokens.
+Multi-turn chat (needs a longer context) → longer pretraining of a compute-optimal 5–25M model → DPO / preference tuning.

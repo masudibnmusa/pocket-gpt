@@ -30,13 +30,15 @@ def non_embedding_params(n_layer, n_head, n_embd):
     return GPT(cfg).num_params() - VOCAB * n_embd  # tied embedding/head excluded, as in Kaplan et al.
 
 
-def run(name, shape):
-    out, log = f"runs/scale_{name}", f"runs/scale_{name}.log"
+def run(name, shape, out=None, extra=()):
+    """Train one size; `extra` flags come last, so they override COMMON (argparse keeps the last value)."""
+    out = out or f"runs/scale_{name}"
+    log = out + ".log"
     if os.path.exists(log) and "saved " in open(log).read():
         return
     n_layer, n_head, n_embd = shape
     cmd = [sys.executable, "-u", "train.py", *COMMON, "--n_layer", str(n_layer), "--n_head", str(n_head),
-           "--n_embd", str(n_embd), "--out", out]
+           "--n_embd", str(n_embd), "--out", out, *extra]
     if os.path.exists(os.path.join(out, "ckpt.pt")):
         cmd.append("--resume")  # an earlier sweep was interrupted mid-run
     print(f"training {name} {shape} -> {log}", flush=True)
@@ -44,8 +46,8 @@ def run(name, shape):
         subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True)
 
 
-def read_curve(name):
-    rows = [STEP_LINE.match(l) for l in open(f"runs/scale_{name}.log")]
+def read_curve(name, log=None):
+    rows = [STEP_LINE.match(l) for l in open(log or f"runs/scale_{name}.log")]
     return np.array([[float(x) for x in m.groups()] for m in rows if m])  # step, train, val, val_bpb
 
 
