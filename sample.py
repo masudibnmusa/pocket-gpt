@@ -23,7 +23,7 @@ model = GPT(GPTConfig(**ckpt["config"])).to(device)
 model.load_state_dict(ckpt["model"])
 model.eval()
 
-tok = load_tokenizer()
+tok = load_tokenizer(ckpt.get("args", {}).get("data", "data/char"))  # the tokenizer the model was trained with
 idx = torch.tensor([tok.encode(args.prompt)], dtype=torch.long, device=device)
 out = model.generate(idx, args.tokens, temperature=args.temperature, top_k=args.top_k)
 print(tok.decode(out[0].tolist()))
