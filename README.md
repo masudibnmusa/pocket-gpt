@@ -17,7 +17,7 @@ pocket-gpt/
 ├── data.py              # Download corpus (Tiny Shakespeare / TinyStories), tokenize -> data/<name>/, random-window batches
 ├── model.py             # Decoder-only transformer: GPT-2 defaults, flags for RoPE / RMSNorm / SwiGLU / no-bias,
 │                        #   hand-written or SDPA (Flash) attention, KV cache, temperature / top-k / top-p sampling
-├── train.py             # AdamW param groups + warmup/cosine, grad clipping, bf16, eval (loss + bits/byte), checkpoint/resume
+├── train.py             # AdamW param groups + warmup/cosine, grad clipping, bf16, torch.compile, eval (loss + bits/byte), checkpoint/resume
 ├── sample.py            # Generate text from a checkpoint with its own tokenizer (KV cache on by default)
 ├── gpt2.py              # Load OpenAI GPT-2 (124M) weights from Hugging Face into model.GPT
 ├── tests/
@@ -45,7 +45,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # TinyStories, 12M params (~400 MB of text -> 98M tokens; ~1 min to prepare)
 .venv/bin/python data.py --dataset tinystories --tokenizer bpe --vocab_size 4096
 .venv/bin/python train.py --data data/tinystories_bpe4096 --out runs/ts_llama \
-    --n_layer 6 --n_head 6 --n_embd 384 --block_size 256 --steps 6000 --warmup 200 --eval_interval 500 \
+    --n_layer 6 --n_head 6 --n_embd 384 --block_size 256 --steps 6000 --warmup 200 --eval_interval 500 --compile \
     --bias false --norm rmsnorm --mlp swiglu --pos rope          # drop this line for GPT-2 style
 .venv/bin/python sample.py --ckpt runs/ts_llama/ckpt.pt --prompt "Once upon a time" --temperature 0.8 --top_p 0.9
 
@@ -70,8 +70,17 @@ Compare across tokenizers by **val bits per byte (bpb)**: loss is per token, and
 | GPT-2 style (learned pos, LayerNorm, GELU) | 1.512 | 0.543 | 256k tok/s | ~6.5 min |
 | Llama style (RoPE, RMSNorm, SwiGLU, no bias) | **1.480** | **0.532** | 171k tok/s | ~9.7 min |
 
-Llama style is better at every step (it reached GPT-2's final 0.543 at step 5000) but ~33% slower per token here,
-since RoPE and RMSNorm run as separate unfused ops without `torch.compile`. Train/val stay within 0.03: no overfitting.
+Llama style is better at every step (it reached GPT-2's final 0.543 at step 5000). Those runs were eager mode, where
+Llama style is ~33% slower because RoPE and RMSNorm run as separate unfused ops. Train/val stay within 0.03: no overfitting.
+
+**`torch.compile`** (`--compile`, same 12M models, 600-step benchmark; loss unchanged):
+
+| | Eager | Compiled | Speedup |
+|---|---|---|---|
+| GPT-2 style | 252k tok/s | 295k tok/s | 1.17x |
+| Llama style | 169k tok/s | 290k tok/s | **1.71x** |
+
+Compilation fuses the elementwise RoPE/RMSNorm/SwiGLU ops, which closes almost the whole gap. It costs ~20 s of warmup, so skip it for short debug runs.
 
 > Once upon a time, there was a little girl named Lily. She had a big, soft teddy bear that she loved very much. One day, she went to the park to play with her teddy bear. While playing, Lily saw a little boy who was sad. He had lost his teddy bear. Lily wanted to help [...] The moral of the story is that when we help others, we make new friends and make them happy.
 >
@@ -93,4 +102,4 @@ almost nothing to save (~375 vs ~405 tok/s on GPU): per-token time is kernel-lau
 - bf16 vs fp32: ~1.20M vs ~0.73M tok/s, same loss.
 
 ## Next
-`torch.compile` (close the Llama-style speed gap) → scaling sweep (model size vs loss) → attention-map / embedding analysis → instruction fine-tuning.
+Scaling sweep (model size vs loss) → attention-map / embedding analysis → instruction fine-tuning.

@@ -25,6 +25,7 @@ p.add_argument("--warmup", type=int, default=100)
 p.add_argument("--grad_clip", type=float, default=1.0, help="max global grad norm; 'inf' disables clipping")
 p.add_argument("--weight_decay", type=float, default=0.1, help="applied to matmul weights and embeddings only")
 p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16", help="autocast dtype for forward passes (CUDA only)")
+p.add_argument("--compile", action="store_true", help="torch.compile the model (~1 min warmup, faster steps)")
 p.add_argument("--eval_interval", type=int, default=250)
 p.add_argument("--eval_iters", type=int, default=100)
 p.add_argument("--data", default="data/char", help="dir made by data.py (train.bin, val.bin, meta.json)")
@@ -58,6 +59,9 @@ opt = torch.optim.AdamW(
     [{"params": decay, "weight_decay": args.weight_decay}, {"params": no_decay, "weight_decay": 0.0}], lr=args.lr
 )
 # bf16 has fp32's exponent range, so unlike fp16 it needs no GradScaler.
+# Compiled wrapper for train/eval forward passes only; `model` stays uncompiled so checkpoints keep plain
+# parameter names and generate() (whose input length changes every step) doesn't trigger recompiles.
+fwd = torch.compile(model) if args.compile else model
 autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda" and args.dtype == "bf16")
 print(f"{model.num_params() / 1e6:.2f}M params on {device} ({args.dtype if device == 'cuda' else 'fp32'}); "
       f"decayed {sum(p.numel() for p in decay):,} / not decayed {sum(p.numel() for p in no_decay):,}; "
@@ -72,7 +76,7 @@ def estimate_loss():
         losses = []
         for _ in range(args.eval_iters):
             with autocast:
-                losses.append(model(*get_batch(d, args.batch_size, cfg.block_size, device))[1].item())
+                losses.append(fwd(*get_batch(d, args.batch_size, cfg.block_size, device))[1].item())
         out[split] = sum(losses) / len(losses)
     model.train()
     return out
@@ -131,7 +135,7 @@ for step in range(start_step, args.steps + 1):
         g["lr"] = lr
     x, y = get_batch(data["train"], args.batch_size, cfg.block_size, device)
     with autocast:
-        _, loss = model(x, y)
+        _, loss = fwd(x, y)
     opt.zero_grad(set_to_none=True)
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # returns the pre-clip norm
