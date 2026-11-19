@@ -1,0 +1,52 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;700;800&display=block" rel="stylesheet">
+<style>
+  :root { --bg:#0b0f14; --fg:#e6edf3; --dim:#8b949e; --green:#3fb950; --line:#1b222c; }
+  * { margin:0; box-sizing:border-box; }
+  body { background:var(--bg); }
+  .banner { width:1280px; height:320px; position:relative; overflow:hidden; background:var(--bg);
+    background-image:linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size:32px 32px; background-position:-1px -1px; display:flex; align-items:center; justify-content:space-between; padding:0 88px; }
+  .banner::after { content:""; position:absolute; inset:0; background:radial-gradient(ellipse at 30% 50%, transparent 30%, var(--bg) 85%); pointer-events:none; }
+  .left, .right { position:relative; z-index:1; }
+  .prompt { font:400 15px 'JetBrains Mono'; color:var(--dim); margin-bottom:10px; }
+  .prompt b { color:var(--green); font-weight:400; }
+  h1 { font:800 68px/1 'JetBrains Mono'; color:var(--fg); letter-spacing:-0.03em; }
+  h1 .cur { display:inline-block; width:0.55em; height:0.85em; background:var(--green); margin-left:10px; vertical-align:-0.06em; }
+  .tag { font:400 21px 'Inter'; color:#b1bac4; margin:16px 0 22px; }
+  .log { font:400 14.5px/1.75 'JetBrains Mono'; color:var(--dim); }
+  .log em { font-style:normal; color:var(--green); }
+  .log i { font-style:normal; color:var(--fg); }
+  .matrix { display:grid; grid-template-columns:repeat(16, 11px); gap:3px; }
+  .matrix span { width:11px; height:11px; border-radius:2px; }
+  .cap { font:400 12.5px 'JetBrains Mono'; color:var(--dim); margin-top:12px; text-align:right; }
+</style></head>
+<body><div class="banner">
+  <div class="left">
+    <div class="prompt"><b>~/pocket-gpt</b> $ python train.py</div>
+    <h1>pocket-gpt<span class="cur"></span></h1>
+    <div class="tag">A tiny GPT language model, built from scratch.</div>
+    <div class="log">
+      <div>step &nbsp;&nbsp;&nbsp;0 │ loss <i>4.207</i> │ ln(65) = 4.174</div>
+      <div>step 3000 │ loss <em>1.536</em> │ val bpb <em>2.21</em> │ <i>0.8M</i> params</div>
+    </div>
+  </div>
+  <div class="right">
+    <div class="matrix" id="m"></div>
+    <div class="cap">causal self-attention</div>
+  </div>
+</div>
+<script>
+  // Lower-triangular attention pattern: future positions masked, diagonal and recent tokens strongest.
+  const m = document.getElementById('m'); let s = 7;
+  const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
+  for (let r = 0; r < 16; r++) for (let c = 0; c < 16; c++) {
+    const el = document.createElement('span');
+    if (c > r) el.style.background = '#151b23';
+    else { const a = c === r ? 0.95 : Math.min(0.9, 0.12 + rnd() * 0.5 + (r - c < 3 ? 0.25 : 0) + (c === 0 ? 0.3 : 0));
+           el.style.background = `rgba(63,185,80,${a.toFixed(2)})`; }
+    m.appendChild(el);
+  }
+</script>
+</body></html>

@@ -1,0 +1,35 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;800&family=JetBrains+Mono:wght@400&display=block" rel="stylesheet">
+<style>
+  :root { --bg:#fbfaf7; --ink:#16181d; --muted:#4a4f57; --soft:#5f646c; --accent:#e8590c; }
+  * { margin:0; box-sizing:border-box; }
+  body { background:var(--bg); }
+  .banner { width:1280px; height:320px; background:var(--bg); display:flex; align-items:center; justify-content:space-between;
+    padding:0 104px; border-bottom:1px solid #ecebe6; }
+  h1 { font:800 80px/1 'Inter'; color:var(--ink); letter-spacing:-0.045em; }
+  h1 span { color:var(--accent); }
+  .tag { font:400 25px 'Inter'; color:var(--muted); margin-top:18px; letter-spacing:-0.01em; }
+  .flow { font:400 15px 'JetBrains Mono'; color:var(--soft); margin-top:26px; }
+  .flow b { font-weight:400; color:var(--accent); }
+  .dots { display:grid; grid-template-columns:repeat(12, 8px); gap:10px; }
+  .dots span { width:8px; height:8px; border-radius:50%; }
+</style></head>
+<body><div class="banner">
+  <div>
+    <h1>pocket-gpt<span>.</span></h1>
+    <div class="tag">A tiny GPT, built from scratch.</div>
+    <div class="flow">tokenizer <b>→</b> transformer <b>→</b> training <b>→</b> sampling</div>
+  </div>
+  <div class="dots" id="d"></div>
+</div>
+<script>
+  // Causal mask as dots: each row (token) sees only itself and earlier tokens.
+  const d = document.getElementById('d');
+  for (let r = 0; r < 12; r++) for (let c = 0; c < 12; c++) {
+    const el = document.createElement('span');
+    el.style.background = c > r ? '#e9e7e1' : `rgba(232,89,12,${(0.25 + 0.75 * (c + 1) / (r + 1)).toFixed(2)})`;
+    d.appendChild(el);
+  }
+</script>
+</body></html>

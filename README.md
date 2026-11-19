@@ -1,15 +1,37 @@
-# pocket-gpt
+![pocket-gpt: a tiny GPT language model, built from scratch](assets/banners/pocket-gpt/gradient-1280x320.png)
+
+![Python](https://img.shields.io/badge/python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/pytorch-2.15-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-bf16-76B900?style=flat-square&logo=nvidia&logoColor=white)
+![Model](https://img.shields.io/badge/model-0.8M_params-6366F1?style=flat-square)
+![Data](https://img.shields.io/badge/data-Tiny_Shakespeare-A21CAF?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-8_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+
 A GPT-style language model built from scratch: BPE tokenizer, transformer, training loop, and sampling, trained on a small corpus.
 
-## Current state
-| File | What |
-|------|------|
-| `bpe.py` | Byte-level BPE from scratch: GPT-4 regex pre-split, merge training, encode/decode (any string round-trips) |
-| `data.py` | Download Tiny Shakespeare, char or BPE tokenize into `data/<name>/{train,val}.bin` + `meta.json`, random-window batches |
-| `model.py` | Decoder-only transformer: hand-written causal attention, pre-norm blocks, tied head, `generate()` with temperature/top-k |
-| `train.py` | AdamW (weight decay on 2D weights only), linear warmup + cosine decay, grad-norm clipping, bf16 autocast, train/val eval with bits per byte, checkpoint + resume |
-| `sample.py` | Generate from a checkpoint (uses the tokenizer it was trained with) |
-| `tests/` | Initial loss ≈ ln(vocab), no future-token leak, overfit one batch, generate shape; BPE round-trip, merges, reload |
+## Project structure
+```text
+pocket-gpt/
+├── bpe.py               # Byte-level BPE from scratch: GPT-4 regex pre-split, merge training, encode/decode
+├── data.py              # Download corpus, char/BPE tokenize -> data/<name>/, random-window batches
+├── model.py             # Decoder-only transformer: causal attention, pre-norm blocks, tied head, generate()
+├── train.py             # AdamW + warmup/cosine, grad clipping, bf16, eval (loss + bits/byte), checkpoint/resume
+├── sample.py            # Generate text from a checkpoint with its own tokenizer
+├── tests/
+│   ├── test_model.py    # initial loss ≈ ln(vocab), no future-token leak, overfit one batch, generate shape
+│   └── test_bpe.py      # first merge, unicode round-trip, compression, reload from merges
+├── assets/banners/      # README banners (PNG) + their HTML sources
+├── requirements.txt     # torch, numpy, regex, pytest
+│
+├── data/                # generated, git-ignored
+│   ├── input.txt        #   raw Tiny Shakespeare (1.1 MB)
+│   ├── char/            #   train.bin, val.bin (uint16 token ids), meta.json (vocab + byte counts)
+│   └── bpe1024/         #   same layout; meta.json holds the learned merges
+└── runs/                # generated, git-ignored
+    └── <run>/ckpt.pt    #   model, optimizer, step, RNG, config, args (saved every eval)
+```
+
+**Data flow:** `input.txt` → `data.py` (tokenizer) → `train.bin`/`val.bin` → `train.py` (batches → `model.py` → cross-entropy → AdamW) → `ckpt.pt` → `sample.py` → text
 
 ## Quickstart
 ```bash
