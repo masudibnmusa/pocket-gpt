@@ -86,6 +86,7 @@ class CausalSelfAttention(nn.Module):
         self.resid_drop = nn.Dropout(cfg.dropout)
         mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool))
         self.register_buffer("mask", mask, persistent=False)
+        self.keep_attn, self.last_attn = False, None  # analysis: set keep_attn (and flash=False) to record weights
         self.rope = cfg.pos == "rope"
         if self.rope:
             cos, sin = rope_tables(cfg.n_embd // cfg.n_head, cfg.block_size)
@@ -115,8 +116,10 @@ class CausalSelfAttention(nn.Module):
         else:
             att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # (B, nh, T, start+T)
             att = att.masked_fill(~mask, float("-inf"))
-            att = self.attn_drop(F.softmax(att, dim=-1))
-            y = att @ v
+            att = F.softmax(att, dim=-1)
+            if self.keep_attn:
+                self.last_attn = att.detach()  # (B, nh, T, start+T)
+            y = self.attn_drop(att) @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # back to (B, T, C)
         return self.resid_drop(self.proj(y))
 
@@ -182,6 +185,14 @@ class GPT(nn.Module):
         if isinstance(m, nn.Linear) and m.bias is not None:
             nn.init.zeros_(m.bias)
 
+    @classmethod
+    def from_checkpoint(cls, path, device="cpu"):
+        """Returns (model in eval mode, raw checkpoint dict)."""
+        ckpt = torch.load(path, map_location=device)
+        model = cls(GPTConfig(**ckpt["config"])).to(device)
+        model.load_state_dict(ckpt["model"])
+        return model.eval(), ckpt
+
     def num_params(self):
         return sum(p.numel() for p in self.parameters())  # tied weights counted once
 
@@ -204,10 +215,12 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True, eos_id=None):
         """temperature 0 = greedy. With use_cache, each step feeds only the newest token; once the context is
-        full, the cache is rebuilt from the last block_size tokens (the same window the uncached path sees)."""
+        full, the cache is rebuilt from the last block_size tokens (the same window the uncached path sees).
+        eos_id: stop early once every sequence has produced it."""
         bs, cache = self.cfg.block_size, None
+        done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
             if not use_cache:
                 logits, _ = self(idx[:, -bs:])
@@ -231,4 +244,8 @@ class GPT(nn.Module):
                     probs = torch.zeros_like(probs).scatter(-1, order, sorted_p)
                 next_id = torch.multinomial(probs, num_samples=1)  # renormalizes internally
             idx = torch.cat([idx, next_id], dim=1)
+            if eos_id is not None:
+                done |= next_id[:, 0] == eos_id
+                if done.all():
+                    break
         return idx

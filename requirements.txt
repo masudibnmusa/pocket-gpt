@@ -3,3 +3,4 @@ numpy
 regex
 pytest
 transformers  # optional: gpt2.py and tests/test_gpt2_parity.py
+matplotlib    # optional: scaling.py and analysis.py plots

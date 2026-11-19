@@ -6,7 +6,7 @@ import time
 import torch
 
 from data import load_tokenizer
-from model import GPT, GPTConfig
+from model import GPT
 
 p = argparse.ArgumentParser()
 p.add_argument("--ckpt", default="runs/char_shakespeare/ckpt.pt")
@@ -22,10 +22,7 @@ args = p.parse_args()
 if args.seed is not None:
     torch.manual_seed(args.seed)
 device = "cuda" if torch.cuda.is_available() else "cpu"
-ckpt = torch.load(args.ckpt, map_location=device)
-model = GPT(GPTConfig(**ckpt["config"])).to(device)
-model.load_state_dict(ckpt["model"])
-model.eval()
+model, ckpt = GPT.from_checkpoint(args.ckpt, device)
 
 tok = load_tokenizer(ckpt.get("args", {}).get("data", "data/char"))  # the tokenizer the model was trained with
 idx = torch.tensor([tok.encode(args.prompt)], dtype=torch.long, device=device)

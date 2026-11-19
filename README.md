@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/model-12M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-30_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-32_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. A 12M-parameter model trained for ~10 minutes on one RTX 5060 writes coherent children's stories.
 
@@ -20,13 +20,18 @@ pocket-gpt/
 ├── train.py             # AdamW param groups + warmup/cosine, grad clipping, bf16, torch.compile, eval (loss + bits/byte), checkpoint/resume
 ├── sample.py            # Generate text from a checkpoint with its own tokenizer (KV cache on by default)
 ├── gpt2.py              # Load OpenAI GPT-2 (124M) weights from Hugging Face into model.GPT
+├── scaling.py           # Scaling sweep: 5 model sizes, same token budget, power-law fit L(N) = c + a·N^-alpha
+├── analysis.py          # Attention maps, induction / previous-token head scores, embedding neighbours + PCA
+├── finetune.py          # Instruction fine-tuning on TinyStories-Instruct (loss on the story only) + word-following eval
 ├── tests/
 │   ├── test_model.py    # per config (GPT-2/Llama x manual/SDPA): initial loss, no future leak, overfit one batch,
 │   │                    #   manual == SDPA attention, KV cache == full forward, cached == uncached generation, top-p
 │   ├── test_bpe.py      # first merge, unicode round-trip, compression, reload, incremental == naive training, specials
+│   ├── test_finetune.py # instruct parsing, loss mask covers only response tokens
 │   └── test_gpt2_parity.py  # our logits == Hugging Face GPT-2 logits (skipped without transformers)
 ├── assets/banners/      # README banners (PNG) + their HTML sources
-├── requirements.txt     # torch, numpy, regex, pytest (+ transformers, optional)
+├── assets/analysis/     # plots written by scaling.py and analysis.py
+├── requirements.txt     # torch, numpy, regex, pytest (+ transformers, matplotlib, optional)
 │
 ├── data/                # generated, git-ignored
 │   ├── input.txt, tinystories_*.txt   # raw corpora
@@ -56,6 +61,11 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Real GPT-2 weights running in this codebase
 .venv/bin/python gpt2.py "Hello, I'm a language model,"
+
+# Experiments (need the TinyStories data above)
+.venv/bin/python scaling.py                                      # 5 sizes, ~15 min, resumable -> assets/analysis/scaling.png
+.venv/bin/python analysis.py --ckpt runs/ts_llama/ckpt.pt        # attention / induction / embedding plots
+.venv/bin/python finetune.py --base runs/ts_llama/ckpt.pt        # instruction SFT + base-vs-SFT eval, ~5 min
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -101,5 +111,74 @@ almost nothing to save (~375 vs ~405 tok/s on GPU): per-token time is kernel-lau
 - Warmup + cosine + clipping vs constant LR: val loss 1.54 at ~3000 steps vs 1.56 at ~4250.
 - bf16 vs fp32: ~1.20M vs ~0.73M tok/s, same loss.
 
+## Scaling sweep
+`python scaling.py` trains five Llama-style models on the same 49M TinyStories tokens (3000 steps, identical
+hyperparameters, `--compile`, ~15 min total) and fits loss against non-embedding parameters N:
+
+| Model | Shape (layers, heads, dim) | Non-emb params | Val loss | Val bpb |
+|---|---|---|---|---|
+| xs | 2, 2, 64 | 0.11M | 2.658 | 0.955 |
+| s | 4, 4, 128 | 0.85M | 2.045 | 0.735 |
+| m | 4, 4, 256 | 3.21M | 1.728 | 0.621 |
+| l | 6, 6, 384 | 10.6M | 1.600 | 0.575 |
+| xl | 8, 8, 512 | 25.7M | 1.516 | 0.545 |
+
+**Fit: L(N) = 1.19 + 36.1 · N^-0.28.** Every 10x in parameters buys less than the last, and loss flattens toward an
+irreducible ~1.19 for this data budget. The larger models are still improving at 49M tokens, so they are data-limited here.
+
+![Scaling sweep](assets/analysis/scaling.png)
+
+## Inside the model
+`python analysis.py --ckpt runs/ts_llama/ckpt.pt` (12M Llama-style model):
+
+**Embeddings** learn meaning with no supervision. Nearest neighbours by cosine similarity:
+
+| Token | Nearest neighbours |
+|---|---|
+| happy | glad, grateful, cheerful, proud, excited, sad |
+| dog | cat, dogs, puppy, horse, bird, squirrel |
+| red | yellow, blue, green, pink, black, purple |
+| mom | mommy, dad, Mom, mother, mum, grandma |
+| big | small, large, huge, little, pretty, long |
+
+![Embedding PCA](assets/analysis/embeddings.png)
+
+**Attention:** every head of every layer on a story prompt (row = query token, column = key token). Layer 3 head 4 is a
+clean *previous-token head* (one step off the diagonal).
+
+![Attention maps](assets/analysis/attention_all.png)
+
+**Induction heads** (attend to the token after the previous occurrence of the current token, so a repeated sequence can
+be copied) are tested on a random 50-token sequence repeated twice. Across the sweep, previous-token heads strengthen
+with size (best score 0.32 → 0.68), but induction scores stay small (0.01 → 0.06) and the repeat gets only modestly
+easier (loss −0.65 at 25.7M). The first half of the induction circuit has formed, the copying half barely has: TinyStories
+rarely repeats arbitrary sequences, and 49M tokens is early in training.
+
+## Instruction fine-tuning
+`python finetune.py --base runs/ts_llama/ckpt.pt` fine-tunes the 12M model on TinyStories-Instruct: a prompt of
+constraints (required words, features like Dialogue/BadEnding, a summary, a sentence to include) followed by the story.
+The loss covers only the story tokens. 3000 steps x 32 examples (61k examples that fit in 256 tokens), ~2 min.
+
+| Model | Story val loss | Required words used (100 held-out prompts) |
+|---|---|---|
+| base (pretrained only) | 1.80 | 15% |
+| fine-tuned | **1.42** | **51%** |
+
+The base model has never seen the prompt format and mostly continues it as text. The fine-tuned model writes a story
+and uses about half the required words. It follows features and summaries only loosely: at 12M parameters, that is
+about as far as instruction-following goes. Same held-out prompt, both models:
+
+```text
+Words: decide, hero, charming
+Features: BadEnding
+Summary: Timmy meets a charming hero during a walk, but the hero turns out to be a bad person [...]
+Story:
+```
+> **base:** Store: Deal: Deal. Deal. Deal?" The hero nodded and said: "Deal.. I'm sorry. I didn't mean to take your toy. [...]
+>
+> **fine-tuned:** Timmy's friends wanted to play with him, but they didn't want to play with him. Timmy felt sad and started to cry. [...] Suddenly, the hero came out and said, "I'm sorry for your friend. I didn't mean to scare you. Let's go away and be friends." Timmy and his friends were happy again and they all went home to play together. The end.
+
+The fine-tuned model writes a proper story with the hero in it, but misses "decide" and "charming" and ignores the bad ending.
+
 ## Next
-Scaling sweep (model size vs loss) → attention-map / embedding analysis → instruction fine-tuning.
+Longer pretraining (to see induction heads form) → compute-optimal sweep (vary tokens as well as parameters) → chat-style SFT with special tokens.
