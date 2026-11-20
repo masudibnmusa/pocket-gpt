@@ -3,10 +3,10 @@
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/pytorch-2.15-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-bf16-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![Model](https://img.shields.io/badge/model-12M_params-6366F1?style=flat-square)
+![Model](https://img.shields.io/badge/model-28M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-34_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-39_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. A 12M-parameter model trained for ~10 minutes on one RTX 5060 writes coherent children's stories.
 
@@ -24,12 +24,16 @@ pocket-gpt/
 ├── isoflop.py           # Compute-optimal (Chinchilla IsoFLOP) sweep: 3 budgets x 5 sizes, optimal N and D vs compute
 ├── analysis.py          # Attention maps, induction / previous-token heads (also over training), embeddings + PCA
 ├── finetune.py          # SFT on TinyStories-Instruct: plain-text or chat format (<|user|>/<|assistant|> tokens)
-├── chat.py              # Talk to a chat-tuned model in the terminal
+├── multiturn.py         # Multi-turn chat SFT: follow-ups answerable only from earlier turns + name-recall eval
+├── dpo.py               # DPO preference tuning: sample, rank by a rule-based reward, train vs a frozen reference
+├── chat.py              # Multi-turn terminal chat (history kept until the context is full, /reset)
 ├── tests/
 │   ├── test_model.py    # per config (GPT-2/Llama x manual/SDPA): initial loss, no future leak, overfit one batch,
 │   │                    #   manual == SDPA attention, KV cache == full forward, cached == uncached generation, top-p
 │   ├── test_bpe.py      # first merge, unicode round-trip, compression, reload, incremental == naive training, specials
 │   ├── test_finetune.py # instruct parsing, response-only loss mask, chat requests name every word, grow_vocab
+│   ├── test_multiturn.py # name facts, per-turn loss masks, conversations fit the context
+│   ├── test_dpo.py      # sequence log-prob counts only the reply, DPO loss = ln 2 when policy == reference
 │   └── test_gpt2_parity.py  # our logits == Hugging Face GPT-2 logits (skipped without transformers)
 ├── assets/banners/      # README banners (PNG) + their HTML sources
 ├── assets/analysis/     # plots written by scaling.py and analysis.py
@@ -77,6 +81,14 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
     --bias false --norm rmsnorm --mlp swiglu --pos rope          # 295M tokens, ~17 min, logs induction scores
 .venv/bin/python finetune.py --base runs/ts_llama_long/ckpt.pt --out runs/ts_llama_long_chat --chat
 .venv/bin/python chat.py --ckpt runs/ts_llama_long_chat/ckpt.pt
+
+# Compute-optimal 28M model with a 1024-token context, then multi-turn chat, then DPO (~75 min total)
+.venv/bin/python train.py --data data/tinystories_bpe4096_2300mb --out runs/ts_xl_1024 --steps 22000 \
+    --n_layer 8 --n_head 8 --n_embd 512 --block_size 1024 --batch_size 16 --warmup 300 --eval_interval 1000 \
+    --compile --induction --bias false --norm rmsnorm --mlp swiglu --pos rope   # 360M tokens, ~45 min
+.venv/bin/python multiturn.py --base runs/ts_xl_1024/ckpt.pt --out runs/ts_xl_chat              # ~6 min
+.venv/bin/python dpo.py --sft runs/ts_xl_chat/ckpt.pt --out runs/ts_xl_dpo                      # ~15 min
+.venv/bin/python chat.py --ckpt runs/ts_xl_dpo/ckpt.pt
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -262,5 +274,73 @@ word constraints less reliably: the words are buried in a sentence instead of a 
 from 30% of requests, and the two role tokens start untrained. In the dragon story it kept the topic; in the second it
 used "boat" and "brave" but missed "moon" and the dialogue.
 
+## Compute-optimal pretraining with a longer context
+At ~6e16 FLOPs (45 min on the RTX 5060), the IsoFLOP fit above puts the optimal size near 30M parameters, so the
+largest sweep shape (8 layers, 8 heads, 512 dim; 27.8M total) was trained on 360M tokens (13 tokens/param) with a
+**1024-token context** (16 x 1024 tokens per step, 133k tok/s with `--compile`, 1.1 GB of GPU memory):
+
+| Model | Params | Context | Tokens | Val loss | Val bpb |
+|---|---|---|---|---|---|
+| ts_llama | 12.2M | 256 | 98M | 1.480 | 0.532 |
+| ts_llama_long | 12.2M | 256 | 295M | 1.337 | 0.489 |
+| **ts_xl_1024** | 27.8M | 1024 | 360M | **1.170** | **0.420** |
+
+Its induction score peaked at 0.18 (repeat gain 1.65 nats), the most of any TinyStories run here, but still nowhere near
+the 0.88 of the repeat-trained control.
+
+## Multi-turn chat
+`multiturn.py` builds conversations from TinyStories-Instruct whose follow-up turns can only be answered from earlier
+turns: a character's name from the story the assistant told ("a dog named Max" → "What was the dog's name?"), a one-line
+summary, the words the user asked for, or a second story with the first still in context. Every assistant turn ends
+with `<|endoftext|>` and only assistant tokens are learned. 90k training conversations (340 tokens on average),
+6000 steps x 8, ~6 min; chat val loss 2.04 → 1.16.
+
+**Does it read the history?** On 200 held-out conversations, turn 1 is a dataset story and turn 2 asks for a character's
+name (greedy decoding):
+
+| History in context | Correct name |
+|---|---|
+| the real story | **98%** |
+| a different conversation's story swapped in | 21% |
+
+So the answer comes from the conversation, not from a memorised favourite name.
+
+```text
+you> Tell me a story about a little bunny named Pip who wants to fly.
+model> Once upon a time, there was a little bunny called Pip. Pip was a very enthusiastic bunny and loved to explore. [...]
+you> What was the bunny's name?
+model> The bunny's name was Pip.
+you> Can you sum it up in one sentence?
+model> Pip, a enthusiastic bunny, discovers a beautiful butterfly and follows it to a beautiful park [...]
+you> Thanks! Now tell me a story about a dragon. Use the words "moon" and "brave".
+model> Once upon a time there was a little girl named Louise. [...] a friendly dragon sitting on a branch nearby. [...]
+you> Which words did I ask you to use?
+model> You asked me to use the words "match", "Pip" and "kip".
+```
+
+The last answer is wrong: in training, "which words" always referred to the *first* request, and here the words were
+in the fourth. The model learned the pattern it was shown, not the general skill.
+
+## DPO preference tuning
+`dpo.py` tunes the multi-turn chat model with Direct Preference Optimization, using a rule-based reward instead of
+human labels:
+
+1. **Sample** 6 replies for each of 1500 story requests (temperature 1.0, top-p 0.95), batching requests of equal token length.
+2. **Rank** each finished reply by the fraction of required words it uses. Best = chosen, worst = rejected; ties skipped.
+   → 1216 pairs; chosen replies use 60% of the words, rejected ones 15%.
+3. **Train** 300 steps x 8 pairs, β = 0.1, lr 5e-6, against a frozen copy of the starting model.
+   DPO loss 0.69 → 0.26, reward accuracy 0.75 → ~1.0.
+4. **Evaluate** 200 held-out requests, plus fluency: the per-token loss of each reply under the pretrained base model,
+   which would rise sharply if DPO learned to just list the words.
+
+| Model | Required words used | Reply length (tokens) | Fluency (judge loss, lower = more natural) |
+|---|---|---|---|
+| multi-turn chat (SFT) | 38% | 195 | 0.997 |
+| + DPO | **43%** | 184 | 1.065 |
+
+A real but modest gain (+5 points) for a small fluency cost and no length inflation. The pairs only teach "use more of
+the words", so that is all that moves; the summary/feature constraints are not rewarded and do not improve.
+
 ## Next
-Multi-turn chat (needs a longer context) → longer pretraining of a compute-optimal 5–25M model → DPO / preference tuning.
+Reward the full request (features, summary) with a learned judge → more DPO rounds on fresh on-policy samples → train
+"which words" questions about any earlier turn, not just the first.

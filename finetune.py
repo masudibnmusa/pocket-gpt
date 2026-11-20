@@ -107,15 +107,62 @@ def load_examples(tok, split, max_mb, block_size, chat=False):
 
 
 def make_batch(examples, device):
-    """Right-pad; targets are -100 (ignored by cross_entropy) on the prompt and padding."""
-    T = max(len(ids) for ids, _, _ in examples) - 1
+    """Right-pad; targets are -100 (ignored by cross_entropy) except on response tokens.
+    Each example is (ids, plen or mask, meta): an int means "learn everything after the first plen tokens"; a list
+    of bools marks exactly which tokens to learn (multi-turn: every assistant turn)."""
+    T = max(len(ex[0]) for ex in examples) - 1
     x = torch.zeros(len(examples), T, dtype=torch.long)
     y = torch.full((len(examples), T), -100, dtype=torch.long)
-    for i, (ids, plen, _) in enumerate(examples):
+    for i, (ids, m, _) in enumerate(examples):
+        mask = torch.tensor(m) if isinstance(m, list) else torch.arange(len(ids)) >= m
         t = torch.tensor(ids)
         x[i, : len(ids) - 1] = t[:-1]
-        y[i, plen - 1 : len(ids) - 1] = t[plen:]  # predict story tokens (and EOT) only
+        y[i, : len(ids) - 1] = torch.where(mask[1:], t[1:], -100)  # position j predicts token j+1
     return x.to(device), y.to(device)
+
+
+def train_sft(model, train, val, device, steps, batch_size, lr, warmup, eval_interval, label="story"):
+    """AdamW + warmup/cosine on response tokens only; prints val loss on `val` every eval_interval steps."""
+    model.train()
+    decay = [p for p in model.parameters() if p.dim() >= 2]
+    no_decay = [p for p in model.parameters() if p.dim() < 2]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}], lr=lr)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warmup) * 0.5 *
+                                              (1 + math.cos(math.pi * min(1.0, s / steps))))
+    autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda")
+    rng = random.Random(0)
+
+    @torch.no_grad()
+    def val_loss():
+        model.eval()
+        losses = []
+        for i in range(0, min(len(val), 50 * batch_size), batch_size):
+            with autocast:
+                losses.append(model(*make_batch(val[i : i + batch_size], device))[1].item())
+        model.train()
+        return sum(losses) / len(losses)
+
+    print(f"step     0 | {label} val loss {val_loss():.4f}", flush=True)
+    t0 = time.time()
+    for step in range(1, steps + 1):
+        x, y = make_batch(rng.sample(train, batch_size), device)
+        with autocast:
+            _, loss = model(x, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sched.step()
+        if step % eval_interval == 0 or step == steps:
+            print(f"step {step:5d} | train {loss.item():.4f} | {label} val loss {val_loss():.4f} | "
+                  f"{time.time() - t0:.0f}s", flush=True)
+    return model.eval()
+
+
+def words_used(story, fields):
+    """(required words found in story, required words); prefix match, so "quit" also counts "quitting"."""
+    words = [w.strip().lower() for w in fields.get("Words", "").split(",") if w.strip()]
+    return sum(bool(re.search(r"\b" + re.escape(w), story.lower())) for w in words), len(words)
 
 
 def word_follow_rate(model, tok, examples, device, n=100, seed=0):
@@ -129,9 +176,8 @@ def word_follow_rate(model, tok, examples, device, n=100, seed=0):
         out = model.generate(torch.tensor([prompt], device=device), model.cfg.block_size - plen,
                              temperature=0.7, top_p=0.9, eos_id=tok.special_ids[EOT])
         story = tok.decode(out[0, plen:].tolist()).split(EOT)[0]
-        words = [w.strip().lower() for w in fields["Words"].split(",") if w.strip()]
-        hit += sum(bool(re.search(r"\b" + re.escape(w), story.lower())) for w in words)  # prefix: "quit" ~ "quitting"
-        total += len(words)
+        h, n = words_used(story, fields)
+        hit, total = hit + h, total + n
         samples.append((tok.decode(prompt), story))
     return hit / total, samples
 
@@ -168,40 +214,7 @@ def main():
         if args.chat:
             model.grow_vocab(len(CHAT_TOKENS))
         assert model.cfg.vocab_size == tok.vocab_size
-        model.train()
-        decay = [p for p in model.parameters() if p.dim() >= 2]
-        no_decay = [p for p in model.parameters() if p.dim() < 2]
-        opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}],
-                                lr=args.lr)
-        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / args.warmup) * 0.5 *
-                                                  (1 + math.cos(math.pi * min(1.0, s / args.steps))))
-        autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda")
-        rng = random.Random(0)
-
-        @torch.no_grad()
-        def val_loss():
-            model.eval()
-            losses = []
-            for i in range(0, 50 * args.batch_size, args.batch_size):
-                with autocast:
-                    losses.append(model(*make_batch(val[i : i + args.batch_size], device))[1].item())
-            model.train()
-            return sum(losses) / len(losses)
-
-        print(f"step     0 | story val loss {val_loss():.4f}")
-        t0 = time.time()
-        for step in range(1, args.steps + 1):
-            x, y = make_batch(rng.sample(train, args.batch_size), device)
-            with autocast:
-                _, loss = model(x, y)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            if step % args.eval_interval == 0 or step == args.steps:
-                print(f"step {step:5d} | train {loss.item():.4f} | story val loss {val_loss():.4f} | "
-                      f"{time.time() - t0:.0f}s")
+        train_sft(model, train, val, device, args.steps, args.batch_size, args.lr, args.warmup, args.eval_interval)
         os.makedirs(args.out, exist_ok=True)
         torch.save({"model": model.state_dict(), "config": asdict(model.cfg), "step": args.steps,
                     "args": {**vars(args), "data": data_dir, "extra_special_tokens": extra}}, ckpt_path)
