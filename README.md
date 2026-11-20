@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/model-28M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-42_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-44_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. A 12M-parameter model trained for ~10 minutes on one RTX 5060 writes coherent children's stories.
 
@@ -97,7 +97,10 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python judge.py --sft runs/ts_xl_chat2/ckpt.pt --half 1 --out runs/judge_b
 .venv/bin/python dpo.py --sft runs/ts_xl_chat2/ckpt.pt --reward judge --judge_rm runs/judge_a/ckpt.pt \
     --eval_judge runs/judge_b/ckpt.pt --rounds 3 --out runs/ts_xl_dpo_judge
-.venv/bin/python chat.py --ckpt runs/ts_xl_dpo/ckpt.pt
+
+# Chat model that also handles greetings, off-topic questions and casual story requests (~7 min)
+.venv/bin/python multiturn.py --base runs/ts_xl_1024/ckpt.pt --out runs/ts_xl_chat3
+.venv/bin/python chat.py --ckpt runs/ts_xl_chat3/ckpt.pt
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -409,6 +412,34 @@ Copying summary wording convinces both judges (they learned "the summary's words
 so this is **reward hacking** of a pattern both judges share, which a held-out judge cannot catch. The fluency check
 does catch it. Round 1 is the best trade-off here (+8 points of words, +5 of dialogue, small fluency cost); more rounds
 would need a KL or fluency penalty in the reward, or judges trained on hard negatives that copy the summary.
+
+## Small talk and casual requests
+Chatting with `ts_xl_chat2` showed a failure the evals missed: every message after a story got the story's summary.
+
+```
+you> bella's male ?     model> Bella explores a beautiful rug in her garden and meets a rude voice.
+you> hello              model> Bella explores a beautiful rug in her garden and meets a friendly voice.
+```
+
+Its training only had story requests and questions about stories, so "summary" was the safe answer to anything.
+`ts_xl_chat3` adds greetings and off-topic questions or random letters, each with a fixed reply. It also makes a
+quarter of the story requests short and casual ("tell me a story"), with no "which words?" questions after them.
+A first try without the casual requests turned "write short children story" down as off-topic: every story request
+it had seen listed words to use.
+
+On phrasings that never appear in training, these are the rates of correct replies:
+
+| Held-out message (after a story) | Without casual requests | `ts_xl_chat3` |
+|---|---|---|
+| Greeting ("hiya", "howdy") | 48% | 45% |
+| Off-topic question | 90% | 100% |
+| Random letters | 100% | 100% |
+| Story request ("story please") | 55% | 88% |
+| Greeting as the first message | 42% | 55% |
+
+Name recall (98%) and words recall (93-97%) are unchanged. Your replayed chat now gets a greeting for "hi" and
+"hello", a story for "write short children story", and the "I only tell stories" reply for the rest. Greetings it
+never saw still fail about half the time; more varied greetings in training would be the next fix.
 
 ## Next
 Add a fluency penalty or KL budget to the reward → judges trained against summary-copying negatives → a bigger

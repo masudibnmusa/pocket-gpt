@@ -47,3 +47,29 @@ def test_word_questions_refer_to_the_right_story():
     assert [qa[q] for q in qa if q in WORDS_LAST_QS] == [latest]
     assert [qa[q] for q in qa if q in WORDS_FIRST_QS] == [first]
     assert not any("name" in q for q in qa)  # "the girl" would be ambiguous: both stories have one
+
+
+def test_small_talk_gets_fixed_replies_and_eval_phrasings_are_held_out():
+    from multiturn import (EVAL_GREETINGS, EVAL_OFF_TOPIC, GREETING_REPLY, GREETINGS, OFF_TOPIC, OFF_TOPIC_REPLY,
+                           small_talk)
+
+    rng = random.Random(0)
+    talk = [small_talk(rng) for _ in range(300)]
+    assert {a for _, a in talk} == {GREETING_REPLY, OFF_TOPIC_REPLY}
+    assert all((q in GREETINGS) == (a == GREETING_REPLY) for q, a in talk)
+    assert not set(EVAL_GREETINGS) & set(GREETINGS) and not set(EVAL_OFF_TOPIC) & set(OFF_TOPIC)
+    convs = build_conversations(TOK, [ENTRY] * 200, 256, random.Random(0))
+    replies = [TOK.decode([t for t, m in zip(ids, mask) if m]) for ids, mask, _ in convs]
+    assert any(GREETING_REPLY in r for r in replies) and any(OFF_TOPIC_REPLY in r for r in replies)
+
+
+
+def test_casual_requests_never_get_word_questions():
+    from multiturn import CASUAL, WORDS_QS, follow_ups, story_request
+
+    fields = {"Words": "run, happy", "Summary": "A dog runs."}
+    reqs = [story_request(fields, random.Random(k)) for k in range(100)]
+    casual = [asked for req, asked in reqs if req in CASUAL]
+    assert casual and len(casual) < len(reqs)
+    for asked in casual:
+        assert not any(q in WORDS_QS for q, _ in follow_ups([(asked, STORY)], random.Random(0)))

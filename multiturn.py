@@ -30,6 +30,46 @@ WORDS_QS = ["Which words did I ask you to use?", "What words did I want in the s
 WORDS_FIRST_QS = ["Which words did I ask for in the first story?", "What words did I want in the first story?"]
 WORDS_LAST_QS = ["Which words did I ask for in the last story?", "What words did I want in the latest story?"]
 ANOTHER = ["Now tell me another story.", "Thanks! One more, please.", "Can you tell me a different story?"]
+# Small talk, off-topic questions and gibberish get fixed replies, so the model stops answering every message that
+# isn't a story question with a summary. The EVAL_ lists are held out to check it generalises beyond these phrasings.
+GREETINGS = ["hi", "Hi!", "hello", "Hello!", "hey", "Hey there!", "Good morning!", "How are you?", "Hi, how are you?",
+             "hello there", "Hi friend!", "Good afternoon."]
+GREETING_REPLY = "Hi! I can tell you a story. What should it be about?"
+OFF_TOPIC = ["What is the capital of France?", "What is 2 + 2?", "Can you help me with my homework?", "What time is it?",
+             "What's the weather like today?", "How do I cook pasta?", "Who won the game yesterday?",
+             "Can you write some code for me?", "What is your favorite color?", "Tell me a joke.", "Who is the president?",
+             "How far away is the moon?", "Can you do my math?", "What does DNA mean?"]
+OFF_TOPIC_REPLY = "Sorry, I only know how to tell stories. What should the story be about?"
+EVAL_GREETINGS = ["hiya", "yo", "Good evening!", "howdy", "hey hey"]
+EVAL_OFF_TOPIC = ["What is the biggest planet?", "How many legs does a spider have?", "Translate cat into French.",
+                  "What is the square root of 81?", "Who invented the phone?"]
+EVAL_NEW_STORY = ["write short children story", "story please", "I want a story about a frog.", "tell me a story now",
+                  "Give me a story about a happy cat."]
+
+
+CASUAL = ["tell me a story", "write a story", "Story time!", "Can I have a story?", "write me a short story",
+          "a story for kids please", "I want a bedtime story.", "Tell me a fun story.", "make up a story",
+          "Can you tell me a story?", "one story please", "write a kids story"]
+
+
+def story_request(fields, rng):
+    """(request, fields the follow-ups may ask about). A quarter are short casual requests with no constraints, so
+    any plain "story please" starts a story; those drop the words, since the user never asked for any."""
+    if rng.random() < 0.25:
+        return rng.choice(CASUAL), {k: v for k, v in fields.items() if k != "Words"}
+    return make_request(fields, rng), fields
+
+
+def gibberish(rng):
+    return "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(3, 10)))
+
+
+def small_talk(rng):
+    """(message, fixed reply): a greeting, an off-topic question or random letters."""
+    r = rng.random()
+    if r < 0.4:
+        return rng.choice(GREETINGS), GREETING_REPLY
+    return (rng.choice(OFF_TOPIC) if r < 0.7 else gibberish(rng)), OFF_TOPIC_REPLY
 
 
 def name_fact(story):
@@ -83,17 +123,24 @@ def encode_turn(tok, user_text, assistant_text):
 
 
 def build_conversations(tok, entries, block_size, rng):
-    """[(ids, mask, meta)]; meta has turn 1's name fact (if any) for the eval. Conversations fit in block_size + 1.
-    Each conversation: a story request, then 1-3 turns, each either a second story (once) or a question."""
+    """[(ids, mask, meta)]; meta has the first story's name fact (if any) for the eval. Conversations fit in
+    block_size + 1. Each conversation: sometimes a greeting first, a story request, then 1-3 turns, each a second story
+    (once), small talk / an off-topic message (fixed reply), or a question about the stories so far."""
     parsed = [(f, s) for f, s in map(parse, entries) if f and s]
     convs = []
     for i, (fields, story) in enumerate(parsed):
-        stories = [(fields, story)]
-        ids, mask = encode_turn(tok, make_request(fields, rng), story)
+        req, asked = story_request(fields, rng)
+        stories = [(asked, story)]
+        ids, mask = encode_turn(tok, *small_talk(rng)) if rng.random() < 0.15 else ([], [])
+        t_ids, t_mask = encode_turn(tok, req, story)
+        ids, mask = ids + t_ids, mask + t_mask
         for _ in range(rng.randint(1, 3)):
-            if len(stories) == 1 and rng.random() < 0.35:
+            if rng.random() < 0.2:
+                (q, a), new = small_talk(rng), None
+            elif len(stories) == 1 and rng.random() < 0.35:
                 f2, s2 = parsed[(i + 1) % len(parsed)]
-                q, a, new = rng.choice(ANOTHER) + " " + make_request(f2, rng), s2, (f2, s2)
+                req, asked2 = story_request(f2, rng)  # half with no "another", so any story request starts a story
+                q, a, new = (rng.choice(ANOTHER) + " " + req if rng.random() < 0.5 else req), s2, (asked2, s2)
             else:
                 options = follow_ups(stories, rng)
                 if not options:
@@ -152,6 +199,33 @@ def words_recall(model, tok, story_pairs, device, which):
     return hits / len(story_pairs)
 
 
+@torch.no_grad()
+def small_talk_eval(model, tok, parsed, device, n=40):
+    """Held-out phrasings only. After a story turn (teacher-forced), send a greeting / off-topic question / gibberish /
+    story request; also a bare greeting with no history. Greedy replies; returns the fraction handled correctly:
+    the fixed reply for small talk, and for a story request a new story (40+ tokens, not the previous summary)."""
+    eot = tok.special_ids[EOT]
+    rng = random.Random(5)
+
+    def answer(history, msg, max_new=120):
+        q = [tok.special_ids[USER]] + tok.encode_ordinary(msg) + [tok.special_ids[ASSISTANT]]
+        prompt = (history + q)[-(model.cfg.block_size - max_new) :]
+        out = model.generate(torch.tensor([prompt], device=device), max_new, temperature=0, eos_id=eot)
+        reply = out[0, len(prompt) :].tolist()
+        return reply[: reply.index(eot)] if eot in reply else reply
+
+    res = {"greeting": 0, "off_topic": 0, "gibberish": 0, "new_story": 0, "greeting_first": 0}
+    for k, (fields, story) in enumerate(parsed[:n]):
+        hist, _ = encode_turn(tok, make_request(fields, random.Random(k)), story)
+        res["greeting"] += tok.decode(answer(hist, rng.choice(EVAL_GREETINGS))) == GREETING_REPLY
+        res["off_topic"] += tok.decode(answer(hist, rng.choice(EVAL_OFF_TOPIC))) == OFF_TOPIC_REPLY
+        res["gibberish"] += tok.decode(answer(hist, gibberish(random.Random(10_000 + k)))) == OFF_TOPIC_REPLY
+        new = answer(hist, rng.choice(EVAL_NEW_STORY))
+        res["new_story"] += len(new) >= 40 and tok.decode(new) != fields.get("Summary")
+        res["greeting_first"] += tok.decode(answer([], rng.choice(EVAL_GREETINGS))) == GREETING_REPLY
+    return {k: v / n for k, v in res.items()}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base", default="runs/ts_xl_1024/ckpt.pt")
@@ -200,6 +274,8 @@ def main():
     story_pairs = list(zip(with_words[0::2], with_words[1::2]))[: args.eval_n]
     print(f"words recall ({len(story_pairs)} two-story conversations): " + ", ".join(
         f"{w} {words_recall(model, tok, story_pairs, device, w):.0%}" for w in ("plain", "first", "last")))
+    talk = small_talk_eval(model, tok, with_words, device)
+    print("held-out small talk handled: " + ", ".join(f"{k} {v:.0%}" for k, v in talk.items()))
 
 
 if __name__ == "__main__":
