@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/model-28M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-39_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-42_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. A 12M-parameter model trained for ~10 minutes on one RTX 5060 writes coherent children's stories.
 
@@ -25,7 +25,8 @@ pocket-gpt/
 ├── analysis.py          # Attention maps, induction / previous-token heads (also over training), embeddings + PCA
 ├── finetune.py          # SFT on TinyStories-Instruct: plain-text or chat format (<|user|>/<|assistant|> tokens)
 ├── multiturn.py         # Multi-turn chat SFT: follow-ups answerable only from earlier turns + name-recall eval
-├── dpo.py               # DPO preference tuning: sample, rank by a rule-based reward, train vs a frozen reference
+├── judge.py             # Learned judge (reward model): does a story fit its request? Features, summary, words
+├── dpo.py               # DPO preference tuning, multi-round on-policy; rule-based or learned-judge reward
 ├── chat.py              # Multi-turn terminal chat (history kept until the context is full, /reset)
 ├── tests/
 │   ├── test_model.py    # per config (GPT-2/Llama x manual/SDPA): initial loss, no future leak, overfit one batch,
@@ -34,6 +35,7 @@ pocket-gpt/
 │   ├── test_finetune.py # instruct parsing, response-only loss mask, chat requests name every word, grow_vocab
 │   ├── test_multiturn.py # name facts, per-turn loss masks, conversations fit the context
 │   ├── test_dpo.py      # sequence log-prob counts only the reply, DPO loss = ln 2 when policy == reference
+│   ├── test_judge.py    # judge scores ignore padding/batch mates, feature-only requests
 │   └── test_gpt2_parity.py  # our logits == Hugging Face GPT-2 logits (skipped without transformers)
 ├── assets/banners/      # README banners (PNG) + their HTML sources
 ├── assets/analysis/     # plots written by scaling.py and analysis.py
@@ -87,7 +89,14 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
     --n_layer 8 --n_head 8 --n_embd 512 --block_size 1024 --batch_size 16 --warmup 300 --eval_interval 1000 \
     --compile --induction --bias false --norm rmsnorm --mlp swiglu --pos rope   # 360M tokens, ~45 min
 .venv/bin/python multiturn.py --base runs/ts_xl_1024/ckpt.pt --out runs/ts_xl_chat              # ~6 min
-.venv/bin/python dpo.py --sft runs/ts_xl_chat/ckpt.pt --out runs/ts_xl_dpo                      # ~15 min
+.venv/bin/python dpo.py --sft runs/ts_xl_chat/ckpt.pt --reward words --rounds 1 --out runs/ts_xl_dpo  # ~15 min
+
+# Learned judges + 3 rounds of judge-rewarded DPO (~40 min)
+.venv/bin/python multiturn.py --base runs/ts_xl_1024/ckpt.pt --out runs/ts_xl_chat2
+.venv/bin/python judge.py --sft runs/ts_xl_chat2/ckpt.pt --half 0 --out runs/judge_a
+.venv/bin/python judge.py --sft runs/ts_xl_chat2/ckpt.pt --half 1 --out runs/judge_b
+.venv/bin/python dpo.py --sft runs/ts_xl_chat2/ckpt.pt --reward judge --judge_rm runs/judge_a/ckpt.pt \
+    --eval_judge runs/judge_b/ckpt.pt --rounds 3 --out runs/ts_xl_dpo_judge
 .venv/bin/python chat.py --ckpt runs/ts_xl_dpo/ckpt.pt
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
@@ -341,6 +350,66 @@ human labels:
 A real but modest gain (+5 points) for a small fluency cost and no length inflation. The pairs only teach "use more of
 the words", so that is all that moves; the summary/feature constraints are not rewarded and do not improve.
 
+### Word questions about any turn
+In the first multi-turn data, "Which words did I ask you to use?" always referred to the first request, and the model
+learned exactly that. Conversations are now built turn by turn: unqualified questions ("which words", "sum it up")
+refer to the latest story, "...in the first story?" / "...in the last story?" name it, and a name question is only
+asked when its noun picks out a single story. On 200 held-out two-story conversations (both with required words):
+
+| Question | Old chat model | Retrained (`ts_xl_chat2`) |
+|---|---|---|
+| "Which words did I ask you to use?" (= latest) | 0% | **100%** |
+| "...in the first story?" | 92% | 95% |
+| "...in the last story?" | 0% | **99%** |
+
+Name recall is unchanged (98% with the real history, 16% with a swapped one).
+
+## A learned judge
+The word reward ignores most of a request (features like a sad ending or dialogue, the summary). `judge.py` trains a
+reward model for the whole request: the chat model's transformer plus a linear head on the hidden state at the closing
+`<|endoftext|>`, with a pairwise (Bradley-Terry) loss, `-log σ(r(request, its story) - r(request, other story))`.
+The "other story" depends on the request type: a random story for full and summary-only requests, a story *missing a
+requested feature* for feature-only requests ("Give it a sad ending. Include some dialogue."), so features must be
+detected rather than inferred from the topic.
+
+Two judges are trained on disjoint halves of 87k entries (2500 steps x 16 pairs, ~8 min each). **Judge A** is the DPO
+reward; **judge B** is used only for evaluation, so the policy cannot score well by exploiting one judge's quirks.
+Held-out accuracy (picks the matching story):
+
+| Judge | Full request | Features only | Summary only |
+|---|---|---|---|
+| A | 96% | 92% | 100% |
+| B | 97% | 92% | 100% |
+
+## Iterative DPO with the judge
+`dpo.py --reward judge --rounds 3`: each round samples 6 replies to 1500 *fresh* requests from the current policy
+(on-policy), rewards them with judge A + 2 x word fraction, trains 300 DPO steps against the policy as it was at the start
+of the round, then evaluates 300 held-out requests (temperature 0.7):
+
+| Model | Words used | Dialogue (when asked) | Judge B score | Judge B win rate vs SFT | Fluency (lower = better) | Length |
+|---|---|---|---|---|---|---|
+| multi-turn SFT | 41% | 90% | 10.1 | – | **0.98** | 183 |
+| round 1 | 49% | **95%** | 12.3 | 82% | 1.11 | 162 |
+| round 2 | 59% | 83% | 13.0 | 87% | 1.22 | 178 |
+| round 3 | **65%** | 86% | **13.2** | **89%** | 1.37 | 221 |
+
+Every round follows the request better by the held-out judge and by word use, and every round is **less fluent**. The
+example shows how: the final model packs the request's own phrases into the story.
+
+```text
+Request: It should be about this: Tom and Anna are excited to go on a holiday with their parents, and they fly on a big
+plane to a place with sun and sand. Include some dialogue. Include the sentence: "They are very excited and want to fly too."
+
+round 3: Tom and Anna are very excited. They are very excited and want to go on a holiday with their mom and dad. [...]
+They are very excited and want to fly on a big plane. They look for a place to go and they see a place with sun and
+sand and sand. [...]
+```
+
+Copying summary wording convinces both judges (they learned "the summary's words appear" = "this story matches"),
+so this is **reward hacking** of a pattern both judges share, which a held-out judge cannot catch. The fluency check
+does catch it. Round 1 is the best trade-off here (+8 points of words, +5 of dialogue, small fluency cost); more rounds
+would need a KL or fluency penalty in the reward, or judges trained on hard negatives that copy the summary.
+
 ## Next
-Reward the full request (features, summary) with a learned judge → more DPO rounds on fresh on-policy samples → train
-"which words" questions about any earlier turn, not just the first.
+Add a fluency penalty or KL budget to the reward → judges trained against summary-copying negatives → a bigger
+pretraining run (the IsoFLOP fit says ~45M parameters for 2x the compute).

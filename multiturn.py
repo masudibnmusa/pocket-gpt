@@ -27,6 +27,8 @@ NOT_NOUNS = {"was", "were", "and", "friends", "old", "boys", "children", "girls"
 SUMMARY_QS = ["Can you sum it up in one sentence?", "What was the story about?", "Tell me what happened, briefly.",
               "Summarize the story for me."]
 WORDS_QS = ["Which words did I ask you to use?", "What words did I want in the story?"]
+WORDS_FIRST_QS = ["Which words did I ask for in the first story?", "What words did I want in the first story?"]
+WORDS_LAST_QS = ["Which words did I ask for in the last story?", "What words did I want in the latest story?"]
 ANOTHER = ["Now tell me another story.", "Thanks! One more, please.", "Can you tell me a different story?"]
 
 
@@ -36,23 +38,40 @@ def name_fact(story):
     return (m.group(1), m.group(2)) if m and m.group(1) not in NOT_NOUNS else None
 
 
+def words_of(fields):
+    return [w.strip() for w in fields.get("Words", "").split(",") if w.strip()]
+
+
 def quote_list(words):
     q = [f'"{w}"' for w in words]
     return q[0] if len(q) == 1 else f"{', '.join(q[:-1])} and {q[-1]}"
 
 
-def follow_ups(fields, story, rng):
-    """Candidate (question, answer) pairs for turn 2+ about turn 1."""
+def words_answer(words):
+    return f"You asked me to use the words {quote_list(words)}."
+
+
+def follow_ups(stories, rng):
+    """Candidate (question, answer) pairs about the conversation so far; stories = [(fields, story)] in order.
+    Unqualified questions ("Which words did I ask you to use?", "sum it up") refer to the latest story;
+    "first"/"last" questions name the story. Name questions only when the noun picks out a single story."""
     out = []
-    fact = name_fact(story)
-    if fact:
-        noun, name = fact
-        out.append((f"What was the {noun}'s name?", f"The {noun}'s name was {name}."))
+    facts = [name_fact(s) for _, s in stories]
+    nouns = [f[0] for f in facts if f]
+    for fact in facts:
+        if fact and nouns.count(fact[0]) == 1:
+            noun, name = fact
+            out.append((f"What was the {noun}'s name?", f"The {noun}'s name was {name}."))
+    fields = stories[-1][0]
     if "Summary" in fields:
         out.append((rng.choice(SUMMARY_QS), fields["Summary"]))
-    words = [w.strip() for w in fields.get("Words", "").split(",") if w.strip()]
-    if words:
-        out.append((rng.choice(WORDS_QS), f"You asked me to use the words {quote_list(words)}."))
+    if words_of(fields):
+        out.append((rng.choice(WORDS_QS), words_answer(words_of(fields))))
+    if len(stories) > 1:
+        if words_of(stories[0][0]):
+            out.append((rng.choice(WORDS_FIRST_QS), words_answer(words_of(stories[0][0]))))
+        if words_of(fields):
+            out.append((rng.choice(WORDS_LAST_QS), words_answer(words_of(fields))))
     return out
 
 
@@ -64,21 +83,28 @@ def encode_turn(tok, user_text, assistant_text):
 
 
 def build_conversations(tok, entries, block_size, rng):
-    """[(ids, mask, meta)]; meta has the name fact (if any) for the eval. Conversations fit in block_size + 1."""
+    """[(ids, mask, meta)]; meta has turn 1's name fact (if any) for the eval. Conversations fit in block_size + 1.
+    Each conversation: a story request, then 1-3 turns, each either a second story (once) or a question."""
     parsed = [(f, s) for f, s in map(parse, entries) if f and s]
     convs = []
     for i, (fields, story) in enumerate(parsed):
+        stories = [(fields, story)]
         ids, mask = encode_turn(tok, make_request(fields, rng), story)
-        turns = follow_ups(fields, story, rng)
-        rng.shuffle(turns)
-        if rng.random() < 0.3:  # sometimes a second story instead of (or after) a question
-            f2, s2 = parsed[(i + 1) % len(parsed)]
-            turns.insert(rng.randrange(len(turns) + 1), (rng.choice(ANOTHER) + " " + make_request(f2, rng), s2))
-        for q, a in turns[: rng.randint(1, 2)]:
+        for _ in range(rng.randint(1, 3)):
+            if len(stories) == 1 and rng.random() < 0.35:
+                f2, s2 = parsed[(i + 1) % len(parsed)]
+                q, a, new = rng.choice(ANOTHER) + " " + make_request(f2, rng), s2, (f2, s2)
+            else:
+                options = follow_ups(stories, rng)
+                if not options:
+                    break
+                (q, a), new = rng.choice(options), None
             t_ids, t_mask = encode_turn(tok, q, a)
             if len(ids) + len(t_ids) > block_size + 1:
                 break
             ids, mask = ids + t_ids, mask + t_mask
+            if new:
+                stories.append(new)
         if len(ids) <= block_size + 1 and any(mask):
             convs.append((ids, mask, {"fields": fields, "story": story, "fact": name_fact(story)}))
     return convs
@@ -103,6 +129,27 @@ def name_recall(model, tok, eval_items, device, shuffle_history=False):
         out = model.generate(torch.tensor([prompt], device=device), 20, temperature=0, eos_id=eot)
         hits += name in tok.decode(out[0, len(prompt) :].tolist()).split(EOT)[0]
     return hits / len(eval_items)
+
+
+@torch.no_grad()
+def words_recall(model, tok, story_pairs, device, which):
+    """Teacher-force two story turns (both with required words), then ask which words were requested:
+    which = "plain" (unqualified, means the latest), "first" or "last". Correct = every expected word quoted in the
+    answer and none of the other request's words."""
+    q_text = {"plain": WORDS_QS[0], "first": WORDS_FIRST_QS[0], "last": WORDS_LAST_QS[0]}[which]
+    hits = 0
+    for k, ((f1, s1), (f2, s2)) in enumerate(story_pairs):
+        r = random.Random(k)
+        t1, _ = encode_turn(tok, make_request(f1, r), s1)
+        t2, _ = encode_turn(tok, ANOTHER[0] + " " + make_request(f2, r), s2)
+        q = [tok.special_ids[USER]] + tok.encode_ordinary(q_text) + [tok.special_ids[ASSISTANT]]
+        prompt = (t1 + t2 + q)[-(model.cfg.block_size - 40) :]
+        out = model.generate(torch.tensor([prompt], device=device), 40, temperature=0, eos_id=tok.special_ids[EOT])
+        ans = tok.decode(out[0, len(prompt) :].tolist()).split(EOT)[0].lower()
+        want = words_of(f1 if which == "first" else f2)
+        other = set(words_of(f2 if which == "first" else f1)) - set(want)
+        hits += all(f'"{w.lower()}"' in ans for w in want) and not any(f'"{o.lower()}"' in ans for o in other)
+    return hits / len(story_pairs)
 
 
 def main():
@@ -149,6 +196,10 @@ def main():
     swapped = name_recall(model, tok, items, device, shuffle_history=True)
     print(f"\nname recall ({len(items)} held-out conversations): {real:.0%} with the real story in context, "
           f"{swapped:.0%} with a different story swapped in")
+    with_words = [(f, s) for f, s in map(parse, load_entries("val", None)) if s and len(words_of(f)) >= 2]
+    story_pairs = list(zip(with_words[0::2], with_words[1::2]))[: args.eval_n]
+    print(f"words recall ({len(story_pairs)} two-story conversations): " + ", ".join(
+        f"{w} {words_recall(model, tok, story_pairs, device, w):.0%}" for w in ("plain", "first", "last")))
 
 
 if __name__ == "__main__":

@@ -206,7 +206,8 @@ class GPT(nn.Module):
     def num_params(self):
         return sum(p.numel() for p in self.parameters())  # tied weights counted once
 
-    def forward(self, idx, targets=None, cache=None):
+    def hidden(self, idx, cache=None):
+        """Final normalised hidden states (B, T, n_embd): everything except the vocabulary projection."""
         B, T = idx.shape
         start = cache.pos if cache is not None else 0
         assert start + T <= self.cfg.block_size, f"sequence length {start + T} > block_size {self.cfg.block_size}"
@@ -218,7 +219,10 @@ class GPT(nn.Module):
             x = block(x, cache)
         if cache is not None:
             cache.pos += T
-        logits = self.lm_head(self.ln_f(x))
+        return self.ln_f(x)
+
+    def forward(self, idx, targets=None, cache=None):
+        logits = self.lm_head(self.hidden(idx, cache))
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))

@@ -34,3 +34,16 @@ def test_conversations_fit_and_learn_every_assistant_turn():
     # make_batch turns the mask into targets: learned tokens appear as targets, nothing else
     x, y = make_batch([(ids, mask, meta)], "cpu")
     assert sorted(y[0][y[0] != -100].tolist()) == sorted(t for t, m in zip(ids, mask) if m)
+
+
+def test_word_questions_refer_to_the_right_story():
+    from multiturn import WORDS_FIRST_QS, WORDS_LAST_QS, WORDS_QS, follow_ups
+
+    s1 = ({"Words": "oak, quit"}, "A girl named Sue saw an oak.")
+    s2 = ({"Words": "moon, boat"}, "A girl named Ann sailed a boat.")
+    qa = dict(follow_ups([s1, s2], random.Random(0)))
+    latest, first = 'You asked me to use the words "moon" and "boat".', 'You asked me to use the words "oak" and "quit".'
+    assert [qa[q] for q in qa if q in WORDS_QS] == [latest]  # unqualified means the latest story
+    assert [qa[q] for q in qa if q in WORDS_LAST_QS] == [latest]
+    assert [qa[q] for q in qa if q in WORDS_FIRST_QS] == [first]
+    assert not any("name" in q for q in qa)  # "the girl" would be ambiguous: both stories have one
