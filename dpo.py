@@ -5,6 +5,8 @@ Each round:
 2. Reward each finished reply:
      --reward words : fraction of required words used (rule-based)
      --reward judge : learned judge A's score (fit to features + summary + words) + word_weight * word fraction
+   minus fluency_weight * the reply's per-token loss under the pretrained LM (a fluency penalty: reward-hacked replies
+   that pack the request's phrases into the story read worse to the base model).
    chosen = best reply, rejected = worst; requests whose replies all score the same are skipped.
 3. Train: loss = -log sigmoid(beta * [(log pi(c) - log ref(c)) - (log pi(r) - log ref(r))]), ref = the policy at the
    start of the round (round 1: the SFT model).
@@ -73,14 +75,42 @@ def word_fraction(tok, reply, fields):
     return hit / n if n else 0.0
 
 
-def make_reward(tok, device, judge=None, word_weight=2.0):
+@torch.no_grad()
+def fluency_nll(lm, replies, device, batch_size=16):
+    """Per-token loss of each reply on its own (no prompt) under the pretrained LM; None for replies under 2 tokens."""
+    out = []
+    autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda")
+    for i in range(0, len(replies), batch_size):
+        chunk = []
+        for r in replies[i : i + batch_size]:
+            r = r[: lm.cfg.block_size]
+            bad = [j for j, t in enumerate(r) if t >= lm.cfg.vocab_size]  # a role token the base LM never saw
+            chunk.append(r[: bad[0]] if bad else r)
+        x = torch.zeros(len(chunk), max(2, max(map(len, chunk))), dtype=torch.long)
+        y = torch.full_like(x, -100)
+        for j, r in enumerate(chunk):
+            if len(r) > 1:
+                x[j, : len(r)], y[j, : len(r) - 1] = torch.tensor(r), torch.tensor(r[1:])
+        y = y.to(device)
+        with autocast:
+            logits, _ = lm(x.to(device))
+        nll = F.cross_entropy(logits.float().transpose(1, 2), y, ignore_index=-100, reduction="none").sum(-1)
+        n = (y != -100).sum(-1)
+        out += [(a / b) if b else None for a, b in zip(nll.tolist(), n.tolist())]
+    return out
+
+
+def make_reward(tok, device, judge=None, word_weight=2.0, fluency_lm=None, fluency_weight=0.0):
     """reward(list of (prompt, fields, reply)) -> list of floats."""
     def reward(items):
-        words = [word_fraction(tok, r, f) for _, f, r in items]
-        if judge is None:
-            return words
-        js = score(judge, [p + r + [tok.special_ids[EOT]] for p, _, r in items], device)
-        return [j + word_weight * w for j, w in zip(js, words)]
+        out = [word_fraction(tok, r, f) for _, f, r in items]
+        if judge is not None:
+            js = score(judge, [p + r + [tok.special_ids[EOT]] for p, _, r in items], device)
+            out = [j + word_weight * w for j, w in zip(js, out)]
+        if fluency_lm is not None and fluency_weight:
+            nll = fluency_nll(fluency_lm, [r for _, _, r in items], device)
+            out = [o - fluency_weight * (n or 0.0) for o, n in zip(out, nll)]
+        return out
     return reward
 
 
@@ -143,12 +173,7 @@ def evaluate(model, tok, items, device, fluency_lm, eval_judge=None):
     m = {"words": sum(words_used(t, f)[0] for t, f in worded) / sum(words_used(t, f)[1] for t, f in worded),
          "dialogue": sum('"' in t for t in dialogue) / max(1, len(dialogue)),
          "length": sum(map(len, replies)) / len(replies)}
-    nll = []
-    for r in replies:
-        ids = r[: fluency_lm.cfg.block_size]
-        if len(ids) > 1:
-            x = torch.tensor([ids], device=device)
-            nll.append(fluency_lm(x[:, :-1], x[:, 1:])[1].item())
+    nll = [n for n in fluency_nll(fluency_lm, replies, device) if n is not None]
     m["fluency"] = sum(nll) / len(nll)
     jb = None
     if eval_judge is not None:
@@ -165,6 +190,8 @@ def main():
     p.add_argument("--judge_rm", default="runs/judge_a/ckpt.pt", help="learned judge used as reward (--reward judge)")
     p.add_argument("--eval_judge", default="runs/judge_b/ckpt.pt", help="held-out judge, evaluation only ('' = none)")
     p.add_argument("--word_weight", type=float, default=2.0, help="reward = judge score + word_weight * word fraction")
+    p.add_argument("--fluency_weight", type=float, default=0.0,
+                   help="minus this x the reply's per-token loss under --fluency_lm (10 ~ the judge's spread)")
     p.add_argument("--out", default="runs/ts_xl_dpo_judge")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--n_requests", type=int, default=1500, help="fresh requests per round")
@@ -186,7 +213,7 @@ def main():
     eot = tok.special_ids[EOT]
     reward_judge = Judge.load(args.judge_rm, device) if args.reward == "judge" else None
     eval_judge = Judge.load(args.eval_judge, device) if args.eval_judge else None
-    reward = make_reward(tok, device, reward_judge, args.word_weight)
+    reward = make_reward(tok, device, reward_judge, args.word_weight, fluency_lm, args.fluency_weight)
 
     # Requests: instruct *train* split, a fresh disjoint slice each round; eval: held-out val split.
     rng = random.Random(0)

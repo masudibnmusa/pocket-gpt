@@ -20,3 +20,14 @@ def test_feature_request_mentions_only_features():
     req = judge_request(fields, "features", random.Random(0))
     assert "dialogue" in req and "sad ending" in req and "oak" not in req and "tree" not in req.lower()
     assert features_of({"Features": "Dialogue, Unknown"}) == ["Dialogue"]
+
+
+def test_paste_request_inserts_summary_between_sentences_and_keeps_the_story():
+    from judge import paste_request
+
+    story = 'Tom saw a dog.\nThe dog said, "Hi!" Tom smiled. They played all day.'
+    fields = {"Summary": "Tom meets a dog."}
+    for k in range(20):
+        bad = paste_request(story, fields, random.Random(k))
+        assert bad.count("Tom meets a dog.") in (2, 3)
+        assert bad.replace("Tom meets a dog. ", "") == story  # only whole phrases added, newlines kept

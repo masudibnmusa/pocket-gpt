@@ -31,3 +31,17 @@ def test_dpo_loss_is_ln2_when_policy_equals_reference():
         pol = ref = seq_logprob(model, x, y)
     margin = 0.1 * ((pol[0] - ref[0]) - (pol[1] - ref[1]))
     assert math.isclose(-F.logsigmoid(margin).item(), math.log(2), rel_tol=1e-6)
+
+
+def test_fluency_nll_matches_unbatched_loss_and_skips_short_replies():
+    from dpo import fluency_nll
+
+    torch.manual_seed(0)
+    lm = GPT(CFG).eval()
+    replies = [[1, 2, 3, 4, 5], [6, 7], [8], [9, 10, 50, 11]]  # 50 >= vocab: cut there (a role token)
+    got = fluency_nll(lm, replies, "cpu", batch_size=3)
+    with torch.no_grad():
+        for r, g in zip([[1, 2, 3, 4, 5], [6, 7], [9, 10]], [got[0], got[1], got[3]]):
+            x = torch.tensor([r])
+            assert math.isclose(g, lm(x[:, :-1], x[:, 1:])[1].item(), rel_tol=1e-4)
+    assert got[2] is None

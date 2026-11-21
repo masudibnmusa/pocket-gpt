@@ -6,6 +6,8 @@ The matching story is the one written for the request; the mismatched one depend
   - full     (summary + words + features): a random other story
   - features (e.g. "Give it a sad ending. Include some dialogue."): a story lacking a requested feature
   - summary  ("It should be about this: ..."): a random other story
+  - copy     (full request with a summary): the matching story with the request's phrases pasted in 2-3 times, the
+             reward hack seen in iterative DPO, so "the summary's words appear" stops meaning "this story matches"
 Two judges are trained on disjoint halves of the data: A gives the DPO reward, B only evaluates, so the policy
 cannot score well on the evaluation by exploiting one judge's quirks.
 
@@ -15,6 +17,7 @@ python judge.py --sft runs/ts_xl_chat2/ckpt.pt --half 1 --out runs/judge_b
 import argparse
 import os
 import random
+import re
 import time
 from dataclasses import asdict
 
@@ -42,6 +45,15 @@ def judge_request(fields, kind, rng):
     if kind == "features":
         return " ".join([rng.choice(OPENERS)] + [FEATURE_TEXT[f] for f in features_of(fields)])
     return f"{rng.choice(OPENERS)} It should be about this: {fields['Summary']}"
+
+
+def paste_request(story, fields, rng):
+    """The story with the summary / required sentence pasted in at 2-3 random sentence ends (formatting kept)."""
+    phrases = [fields["Summary"]] + ([fields["Random sentence"]] if "Random sentence" in fields else [])
+    ends = [m.end() for m in re.finditer(r'[.!?]"? ', story)] or [len(story)]
+    for pos in sorted(rng.sample(ends, min(len(ends), rng.randint(2, 3))), reverse=True):
+        story = story[:pos] + rng.choice(phrases) + " " + story[pos:]
+    return story
 
 
 class Judge(nn.Module):
@@ -88,7 +100,7 @@ def make_pairs(tok, parsed, rng, block_size):
     """[(matching seq, mismatched seq, kind)] from parsed (fields, story) entries."""
     pairs = []
     for fields, story in parsed:
-        kinds = ["full"] + (["features"] if features_of(fields) else []) + (["summary"] if "Summary" in fields else [])
+        kinds = ["full"] + (["features"] if features_of(fields) else []) + (["summary", "copy"] if "Summary" in fields else [])
         kind = rng.choice(kinds)
         if kind == "features":
             want = set(features_of(fields))
@@ -98,11 +110,13 @@ def make_pairs(tok, parsed, rng, block_size):
                     break
             else:
                 continue
+        elif kind == "copy":
+            s2 = paste_request(story, fields, rng)
         else:
             f2, s2 = rng.choice(parsed)
             if s2 == story:
                 continue
-        req = judge_request(fields, kind, rng)
+        req = judge_request(fields, "full" if kind == "copy" else kind, rng)
         good, bad = encode_pair(tok, req, story), encode_pair(tok, req, s2)
         if max(len(good), len(bad)) <= min(block_size, MAX_LEN):
             pairs.append((good, bad, kind))
@@ -114,7 +128,7 @@ def accuracy(judge, pairs, device):
     s_good = score(judge, [g for g, _, _ in pairs], device)
     s_bad = score(judge, [b for _, b, _ in pairs], device)
     res = {}
-    for kind in ("full", "features", "summary"):
+    for kind in ("full", "features", "summary", "copy"):
         idx = [i for i, p in enumerate(pairs) if p[2] == kind]
         res[kind] = sum(s_good[i] > s_bad[i] for i in idx) / max(1, len(idx))
     return res

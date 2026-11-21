@@ -141,7 +141,7 @@ for step in range(start_step, args.steps + 1):
         print(f"step {step:5d} | train {losses['train']:.4f} | val {losses['val']:.4f} | "
               f"val bpb {val_bits_per_byte(losses['val']):.3f} | "
               f"lr {lr:.2e} | grad norm {grad_norm.item():.2f} | {tok_s:,.0f} tok/s"
-              + (induction_report() if args.induction else ""))
+              + (induction_report() if args.induction else ""), flush=True)
         save(step, rng)
         t0 = time.time()
     if step == args.steps:
