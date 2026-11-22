@@ -59,3 +59,15 @@ def test_fluency_penalty_is_a_hinge_above_the_margin():
     m = (nll[0] + nll[1]) / 2  # between the two losses: exactly one reply is penalised
     got = make_reward(tok, "cpu", fluency_lm=lm, fluency_weight=10, fluency_margin=m)([([0], {}, r) for r in replies])
     assert sorted(got) == [-10 * (max(nll) - m), 0.0]
+
+
+def test_token_kl_is_zero_for_same_model_and_matches_manual():
+    from dpo import token_kl
+
+    torch.manual_seed(0)
+    p, q = torch.randn(2, 5, 7), torch.randn(2, 5, 7)
+    y = torch.tensor([[-100, 1, 2, -100, 3], [-100, -100, 4, 5, 6]])
+    assert token_kl(p, p, y).abs().item() < 1e-6
+    lp, lq = torch.log_softmax(p, -1), torch.log_softmax(q, -1)
+    manual = [(lp[i, t].exp() * (lp[i, t] - lq[i, t])).sum() for i in range(2) for t in range(5) if y[i, t] != -100]
+    assert math.isclose(token_kl(p, q, y).item(), (sum(manual) / len(manual)).item(), rel_tol=1e-5)

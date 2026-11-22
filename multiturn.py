@@ -32,8 +32,12 @@ WORDS_LAST_QS = ["Which words did I ask for in the last story?", "What words did
 ANOTHER = ["Now tell me another story.", "Thanks! One more, please.", "Can you tell me a different story?"]
 # Small talk, off-topic questions and gibberish get fixed replies, so the model stops answering every message that
 # isn't a story question with a summary. The EVAL_ lists are held out to check it generalises beyond these phrasings.
-GREETINGS = ["hi", "Hi!", "hello", "Hello!", "hey", "Hey there!", "Good morning!", "How are you?", "Hi, how are you?",
-             "hello there", "Hi friend!", "Good afternoon."]
+GREET_WORDS = ["hi", "hello", "hey", "hey there", "hi there", "hello there", "good morning", "good afternoon", "good day",
+               "greetings", "hi friend", "hello friend", "morning", "heya", "hullo", "hi buddy", "hey friend",
+               "hello bot", "hi storyteller", "hey you", "hello again", "hi again"]
+GREET_ENDS = ["", "!", ".", "!!", " :)", "~", ","]
+GREET_MORE = ["How are you?", "How are you doing?", "What's up?", "Nice to meet you.", "Are you there?",
+              "How's it going?", "Anyone there?", "How is your day?"]
 GREETING_REPLY = "Hi! I can tell you a story. What should it be about?"
 OFF_TOPIC = ["What is the capital of France?", "What is 2 + 2?", "Can you help me with my homework?", "What time is it?",
              "What's the weather like today?", "How do I cook pasta?", "Who won the game yesterday?",
@@ -64,11 +68,26 @@ def gibberish(rng):
     return "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(3, 10)))
 
 
+def greeting(rng):
+    """A greeting assembled from parts (word, capitalisation, punctuation, a follow-on question), so the model learns
+    the pattern rather than a list. Never one of the held-out EVAL_GREETINGS."""
+    held_out = {e.lower().strip("!.") for e in EVAL_GREETINGS}
+    while True:
+        if rng.random() < 0.1:
+            msg = rng.choice(GREET_MORE)
+        else:
+            w = rng.choice(GREET_WORDS)
+            w = rng.choice([w, w, w.capitalize(), w.title(), w.upper()])
+            msg = (w + rng.choice(GREET_ENDS) + (" " + rng.choice(GREET_MORE) if rng.random() < 0.3 else "")).strip()
+        if msg.lower().strip("!.~:), ") not in held_out:
+            return msg
+
+
 def small_talk(rng):
     """(message, fixed reply): a greeting, an off-topic question or random letters."""
     r = rng.random()
     if r < 0.4:
-        return rng.choice(GREETINGS), GREETING_REPLY
+        return greeting(rng), GREETING_REPLY
     return (rng.choice(OFF_TOPIC) if r < 0.7 else gibberish(rng)), OFF_TOPIC_REPLY
 
 
@@ -123,37 +142,48 @@ def encode_turn(tok, user_text, assistant_text):
 
 
 def build_conversations(tok, entries, block_size, rng):
-    """[(ids, mask, meta)]; meta has the first story's name fact (if any) for the eval. Conversations fit in
-    block_size + 1. Each conversation: sometimes a greeting first, a story request, then 1-3 turns, each a second story
-    (once), small talk / an off-topic message (fixed reply), or a question about the stories so far."""
+    """[(ids, mask, meta)]; meta has the first story's name fact (if any) for the eval, and "turns": one
+    (reply start, reply end, kind, fields) per assistant turn, kind "story" / "talk" / "question" (fields: what a story
+    turn was asked for, else {}). Conversations fit in block_size + 1. Each conversation: sometimes a greeting first, a
+    story request, then 1-3 turns, each a second story (once), small talk / an off-topic message (fixed reply), or a
+    question about the stories so far."""
     parsed = [(f, s) for f, s in map(parse, entries) if f and s]
     convs = []
     for i, (fields, story) in enumerate(parsed):
         req, asked = story_request(fields, rng)
         stories = [(asked, story)]
-        ids, mask = encode_turn(tok, *small_talk(rng)) if rng.random() < 0.15 else ([], [])
-        t_ids, t_mask = encode_turn(tok, req, story)
-        ids, mask = ids + t_ids, mask + t_mask
+        ids, mask, turns = [], [], []
+
+        def add(q, a, kind, f):
+            t_ids, t_mask = encode_turn(tok, q, a)
+            if len(ids) + len(t_ids) > block_size + 1:
+                return False
+            turns.append((len(ids) + t_mask.index(True), len(ids) + len(t_ids), kind, f))
+            ids.extend(t_ids)
+            mask.extend(t_mask)
+            return True
+
+        if rng.random() < 0.3:
+            add(*small_talk(rng), "talk", {})
+        add(req, story, "story", asked)
         for _ in range(rng.randint(1, 3)):
             if rng.random() < 0.2:
-                (q, a), new = small_talk(rng), None
+                (q, a), kind, new = small_talk(rng), "talk", None
             elif len(stories) == 1 and rng.random() < 0.35:
                 f2, s2 = parsed[(i + 1) % len(parsed)]
                 req, asked2 = story_request(f2, rng)  # half with no "another", so any story request starts a story
-                q, a, new = (rng.choice(ANOTHER) + " " + req if rng.random() < 0.5 else req), s2, (asked2, s2)
+                q, a, kind, new = (rng.choice(ANOTHER) + " " + req if rng.random() < 0.5 else req), s2, "story", (asked2, s2)
             else:
                 options = follow_ups(stories, rng)
                 if not options:
                     break
-                (q, a), new = rng.choice(options), None
-            t_ids, t_mask = encode_turn(tok, q, a)
-            if len(ids) + len(t_ids) > block_size + 1:
+                (q, a), kind, new = rng.choice(options), "question", None
+            if not add(q, a, kind, new[0] if new else {}):
                 break
-            ids, mask = ids + t_ids, mask + t_mask
             if new:
                 stories.append(new)
-        if len(ids) <= block_size + 1 and any(mask):
-            convs.append((ids, mask, {"fields": fields, "story": story, "fact": name_fact(story)}))
+        if any(mask):
+            convs.append((ids, mask, {"fields": fields, "story": story, "fact": name_fact(story), "turns": turns}))
     return convs
 
 
@@ -200,7 +230,7 @@ def words_recall(model, tok, story_pairs, device, which):
 
 
 @torch.no_grad()
-def small_talk_eval(model, tok, parsed, device, n=40):
+def small_talk_eval(model, tok, parsed, device, n=100):
     """Held-out phrasings only. After a story turn (teacher-forced), send a greeting / off-topic question / gibberish /
     story request; also a bare greeting with no history. Greedy replies; returns the fraction handled correctly:
     the fixed reply for small talk, and for a story request a new story (40+ tokens, not the previous summary)."""

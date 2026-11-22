@@ -101,3 +101,20 @@ def test_top_p_keeps_only_the_nucleus():
     model.ln_f.bias.data.fill_(5.0)  # every hidden state -> all 5s, so logit_3 = 5*32, logit_7 = 4.5*32
     out = model.generate(torch.zeros((1, 1), dtype=torch.long), 50, temperature=1.0, top_p=0.5)
     assert set(out[0, 1:].tolist()) == {3}
+
+
+def test_left_padded_generation_matches_unpadded():
+    import torch
+
+    from model import GPT, GPTConfig
+
+    torch.manual_seed(0)
+    m = GPT(GPTConfig(vocab_size=50, block_size=32, n_layer=2, n_head=2, n_embd=32, bias=False, norm="rmsnorm",
+                      mlp="swiglu", pos="rope")).eval()
+    short, long = [5, 6, 7], [1, 2, 3, 4, 8, 9, 10]
+    alone = m.generate(torch.tensor([short]), 6, temperature=0)[0, 3:].tolist()
+    batch = torch.tensor([[0] * 4 + short, long])
+    pad = torch.tensor([[True] * 4 + [False] * 3, [False] * 7])
+    both = m.generate(batch, 6, temperature=0, pad=pad)
+    assert both[0, 7:].tolist() == alone
+    assert both[1, 7:].tolist() == m.generate(torch.tensor([long]), 6, temperature=0)[0, 7:].tolist()

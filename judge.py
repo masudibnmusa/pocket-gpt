@@ -8,6 +8,8 @@ The matching story is the one written for the request; the mismatched one depend
   - summary  ("It should be about this: ..."): a random other story
   - copy     (full request with a summary): the matching story with 2-3 stretches replaced by the request's phrases, the
              reward hack seen in iterative DPO, so "the summary's words appear" stops meaning "this story matches"
+  - conv     a random assistant turn of a multi-turn conversation, with its history: the real reply vs a wrong one
+             (another conversation's reply, usually of the same kind: a story, an answer, or the other fixed reply)
 Two judges are trained on disjoint halves of the data: A gives the DPO reward, B only evaluates, so the policy
 cannot score well on the evaluation by exploiting one judge's quirks.
 
@@ -19,6 +21,7 @@ import os
 import random
 import re
 import time
+from collections import defaultdict
 from dataclasses import asdict
 
 import torch
@@ -28,7 +31,7 @@ import torch.nn.functional as F
 from data import EOT, load_tokenizer
 from finetune import ASSISTANT, CHAT_TOKENS, FEATURE_TEXT, OPENERS, USER, make_request, parse
 from model import GPT, GPTConfig
-from multiturn import load_entries
+from multiturn import build_conversations, load_entries
 
 # Judged sequences are request (~100 tokens) + reply (DPO samples <= 320), so longer training pairs add nothing
 # but memory (32 x 1024 tokens does not fit next to the desktop on an 8 GB GPU).
@@ -136,12 +139,34 @@ def make_pairs(tok, parsed, rng, block_size):
     return pairs
 
 
+def conversation_pairs(tok, convs, rng):
+    """[(good, bad, "conv")] from build_conversations output. History longer than MAX_LEN is cut at a <|user|> turn
+    boundary (shortcut: a cut can drop the turn a question refers to; fine while such pairs are rare)."""
+    replies = defaultdict(list)
+    for ids, _, meta in convs:
+        for a, b, kind, _ in meta["turns"]:
+            replies[kind].append(ids[a:b])
+    user = tok.special_ids[USER]
+    pairs = []
+    for ids, _, meta in convs:
+        a, b, kind, _ = rng.choice(meta["turns"])
+        wrong = rng.choice(replies[kind if rng.random() < 0.7 else rng.choice(list(replies))])
+        if wrong == ids[a:b]:
+            continue
+        need = a + max(b - a, len(wrong)) - MAX_LEN  # tokens to drop from the front
+        starts = [j for j in range(a) if ids[j] == user and j >= need]
+        if not starts:
+            continue
+        pairs.append((ids[starts[0] : b], ids[starts[0] : a] + wrong, "conv"))
+    return pairs
+
+
 def accuracy(judge, pairs, device):
     """Per request type: fraction of pairs where the matching story scores higher."""
     s_good = score(judge, [g for g, _, _ in pairs], device)
     s_bad = score(judge, [b for _, b, _ in pairs], device)
     res = {}
-    for kind in ("full", "features", "summary", "copy"):
+    for kind in ("full", "features", "summary", "copy", "conv"):
         idx = [i for i, p in enumerate(pairs) if p[2] == kind]
         res[kind] = sum(s_good[i] > s_bad[i] for i in idx) / max(1, len(idx))
     return res
@@ -165,11 +190,15 @@ def main():
     judge.gpt.load_state_dict(sft.state_dict())
     del sft
 
-    parsed = [(f, s) for f, s in map(parse, load_entries("train", 100)) if f and s][args.half :: 2]
+    entries = load_entries("train", 100)[args.half :: 2]
+    parsed = [(f, s) for f, s in map(parse, entries) if f and s]
     bs = judge.gpt.cfg.block_size
-    train = make_pairs(tok, parsed, random.Random(args.half), bs)
-    val_parsed = [(f, s) for f, s in map(parse, load_entries("val", None)) if f and s][:3000]
-    val = make_pairs(tok, val_parsed, random.Random(99), bs)  # same val pairs for both judges
+    rng = random.Random(args.half)
+    train = make_pairs(tok, parsed, rng, bs) + conversation_pairs(tok, build_conversations(tok, entries, bs, rng), rng)
+    val_entries = load_entries("val", None)[:3000]
+    val_parsed = [(f, s) for f, s in map(parse, val_entries) if f and s]
+    vrng = random.Random(99)  # same val pairs for both judges
+    val = make_pairs(tok, val_parsed, vrng, bs) + conversation_pairs(tok, build_conversations(tok, val_entries, bs, vrng), vrng)
     print(f"{len(train):,} train pairs, {len(val):,} val pairs", flush=True)
     print(f"step     0 | val accuracy {accuracy(judge, val, device)}", flush=True)
 

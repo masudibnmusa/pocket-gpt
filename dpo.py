@@ -10,7 +10,10 @@ Each round:
    leaves ordinary replies unpenalised, since a plain linear penalty also favours short replies).
    chosen = best reply, rejected = worst; requests whose replies all score the same are skipped.
 3. Train: loss = -log sigmoid(beta * [(log pi(c) - log ref(c)) - (log pi(r) - log ref(r))]), ref = the policy at the
-   start of the round (round 1: the SFT model).
+   start of the round (round 1: the SFT model), + kl_coef * the per-token KL(pi || SFT) over the pair's reply tokens
+   (full next-token distributions), which anchors every round to the SFT model.
+   --conv_frac of the requests are a random turn of a multi-turn conversation (story, small talk or a question
+   about earlier stories) instead of a single story request; the judge sees the whole history.
 4. Evaluate on held-out requests: required words, dialogue when asked for, judge B (trained on disjoint data, never
    used as reward) score and win rate vs the SFT model, fluency under the pretrained LM, reply length.
 
@@ -33,41 +36,51 @@ from data import EOT, load_tokenizer
 from finetune import CHAT_TOKENS, encode_prompt, make_batch, parse, words_used
 from judge import Judge, score
 from model import GPT
-from multiturn import load_entries
+from multiturn import build_conversations, load_entries
+
+
+def logprob_of(logits, y):
+    """Sum of log p(target) over the learned (non -100) positions of each row."""
+    lp = torch.log_softmax(logits.float(), dim=-1).gather(-1, y.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    return (lp * (y != -100)).sum(-1)
 
 
 def seq_logprob(model, x, y):
-    """Sum of log p(target) over the learned (non -100) positions of each row."""
-    logits, _ = model(x)
-    lp = torch.log_softmax(logits.float(), dim=-1).gather(-1, y.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-    return (lp * (y != -100)).sum(-1)
+    return logprob_of(model(x)[0], y)
+
+
+def token_kl(logits, ref_logits, y):
+    """Mean over learned positions of KL(softmax(logits) || softmax(ref_logits))."""
+    lp, lq = torch.log_softmax(logits.float(), -1), torch.log_softmax(ref_logits.float(), -1)
+    m = y != -100
+    return ((lp.exp() * (lp - lq)).sum(-1) * m).sum() / m.sum()
 
 
 @torch.no_grad()
 def generate_replies(model, tok, prompts, k, device, temperature, top_p, batch_seqs=96, max_new=320,
                      keep_unfinished=False):
     """k replies per prompt -> list (per prompt) of k reply id lists. A reply that never reached EOT is None
-    (training pairs need finished replies) unless keep_unfinished. Prompts of equal token length are batched
-    together, so generate() needs no padding."""
+    (training pairs need finished replies) unless keep_unfinished. Prompts are sorted by length and left-padded to the
+    longest in their batch; generate() masks the padding."""
     eot = tok.special_ids[EOT]
-    buckets = defaultdict(list)
-    for i, p in enumerate(prompts):
-        buckets[len(p)].append(i)
     out = [None] * len(prompts)
     autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda")
     per = max(1, batch_seqs // k)
-    for plen, members in buckets.items():
-        for c in range(0, len(members), per):
-            chunk = members[c : c + per]
-            idx = torch.tensor([prompts[i] for i in chunk for _ in range(k)], device=device)
-            with autocast:
-                # prompt + reply (incl. EOT) must fit the context, or training on the pair is impossible
-                gen = model.generate(idx, min(max_new, model.cfg.block_size - plen), temperature=temperature,
-                                     top_p=top_p, eos_id=eot)
-            rows = gen[:, plen:].tolist()
-            for j, i in enumerate(chunk):
-                out[i] = [r[: r.index(eot)] if eot in r else (r if keep_unfinished else None)
-                          for r in rows[j * k : (j + 1) * k]]
+    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
+    for c in range(0, len(order), per):
+        chunk = order[c : c + per]
+        plen = max(len(prompts[i]) for i in chunk)
+        rows = [[eot] * (plen - len(prompts[i])) + prompts[i] for i in chunk for _ in range(k)]
+        pad = [[True] * (plen - len(prompts[i])) + [False] * len(prompts[i]) for i in chunk for _ in range(k)]
+        idx = torch.tensor(rows, device=device)
+        with autocast:
+            # prompt + reply (incl. EOT) must fit the context, or training on the pair is impossible
+            gen = model.generate(idx, min(max_new, model.cfg.block_size - plen), temperature=temperature,
+                                 top_p=top_p, eos_id=eot, pad=torch.tensor(pad, device=device))
+        rows = gen[:, plen:].tolist()
+        for j, i in enumerate(chunk):
+            out[i] = [r[: r.index(eot)] if eot in r else (r if keep_unfinished else None)
+                      for r in rows[j * k : (j + 1) * k]]
     return out
 
 
@@ -132,7 +145,7 @@ def build_pairs(requests, replies, reward):
     return pairs
 
 
-def dpo_train(policy, ref, pairs, eot, device, steps, batch_size, lr, beta):
+def dpo_train(policy, ref, pairs, eot, device, steps, batch_size, lr, beta, kl_model=None, kl_coef=0.0):
     opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 20))
     autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda")
@@ -143,12 +156,16 @@ def dpo_train(policy, ref, pairs, eot, device, steps, batch_size, lr, beta):
         rows = [(p + c + [eot], len(p), None) for p, c, *_ in batch] + [(p + r + [eot], len(p), None) for p, _, r, *_ in batch]
         x, y = make_batch(rows, device)
         with autocast:
-            pol = seq_logprob(policy, x, y)
+            logits = policy(x)[0]
+            pol = logprob_of(logits, y)
             with torch.no_grad():
                 rf = seq_logprob(ref, x, y)
+                kl_logits = kl_model(x)[0] if kl_coef else None
         n = len(batch)
         margin = beta * ((pol[:n] - rf[:n]) - (pol[n:] - rf[n:]))  # implicit reward of chosen minus rejected
         loss = -F.logsigmoid(margin).mean()
+        kl = token_kl(logits, kl_logits, y) if kl_coef else torch.zeros(())
+        loss = loss + kl_coef * kl
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
@@ -156,7 +173,7 @@ def dpo_train(policy, ref, pairs, eot, device, steps, batch_size, lr, beta):
         sched.step()
         if step % 50 == 0 or step == steps:
             print(f"  step {step:4d} | dpo loss {loss.item():.4f} | reward acc {(margin > 0).float().mean().item():.2f} | "
-                  f"margin {margin.mean().item():.3f}", flush=True)
+                  f"margin {margin.mean().item():.3f} | kl to sft {kl.item():.4f}", flush=True)
     return policy.eval()
 
 
@@ -204,6 +221,8 @@ def main():
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--eval_n", type=int, default=300)
+    p.add_argument("--kl_coef", type=float, default=0.0, help="weight of the per-token KL(policy || SFT) in the loss")
+    p.add_argument("--conv_frac", type=float, default=0.0, help="share of requests that are a turn of a conversation")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -218,11 +237,25 @@ def main():
     eval_judge = Judge.load(args.eval_judge, device) if args.eval_judge else None
     reward = make_reward(tok, device, reward_judge, args.word_weight, fluency_lm, args.fluency_weight,
                          args.fluency_margin)
+    sft_model = copy.deepcopy(policy).requires_grad_(False) if args.kl_coef else None
 
     # Requests: instruct *train* split, a fresh disjoint slice each round; eval: held-out val split.
     rng = random.Random(0)
-    pool = [(encode_prompt(tok, f, True, rng), f) for f, s in map(parse, load_entries("train", 100)) if f and s and f.get("Words")]
+    train_entries = load_entries("train", 100)
+    pool = [(encode_prompt(tok, f, True, rng), f) for f, s in map(parse, train_entries) if f and s and f.get("Words")]
     random.Random(1).shuffle(pool)
+    if args.conv_frac:  # replace that share of the pool with conversation turns: history up to a reply, its fields
+        n_conv = int(args.conv_frac * args.rounds * args.n_requests)
+        crng = random.Random(3)
+        convs = build_conversations(tok, train_entries[-4 * n_conv :], policy.cfg.block_size, crng)
+        turns = []
+        for ids, _, meta in convs:
+            a, _, kind, f = crng.choice(meta["turns"])
+            if a <= policy.cfg.block_size - 200:  # room for a reply
+                turns.append((ids[:a], f if kind == "story" else {}))
+        pool = pool[: args.rounds * args.n_requests]
+        for j, t in zip(sorted(crng.sample(range(len(pool)), n_conv)), turns):
+            pool[j] = t
     vrng = random.Random(2)
     items = [(encode_prompt(tok, f, True, vrng), f) for f, s in map(parse, load_entries("val", None)) if f and s][: args.eval_n]
     os.makedirs(args.out, exist_ok=True)
@@ -243,7 +276,8 @@ def main():
         print(f"round {rnd}: {len(pairs)} pairs; mean reward chosen {sum(p[3] for p in pairs) / len(pairs):.2f}, "
               f"rejected {sum(p[4] for p in pairs) / len(pairs):.2f}", flush=True)
         ref = copy.deepcopy(policy).requires_grad_(False)  # each round is anchored to where it started
-        dpo_train(policy, ref, pairs, eot, device, args.steps, args.batch_size, args.lr, args.beta)
+        dpo_train(policy, ref, pairs, eot, device, args.steps, args.batch_size, args.lr, args.beta, sft_model,
+                  args.kl_coef)
         del ref
         torch.save({"model": policy.state_dict(), "config": asdict(policy.cfg), "step": rnd * args.steps,
                     "args": {**vars(args), "data": data_dir, "extra_special_tokens": CHAT_TOKENS}},

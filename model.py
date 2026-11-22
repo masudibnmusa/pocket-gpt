@@ -62,6 +62,7 @@ class KVCache:
         self.k, self.v = [None] * n_layer, [None] * n_layer
         self.max_len = max_len
         self.pos = 0  # number of positions already stored
+        self.pad = None  # optional (B, max_len) bool, True = left padding that no position may attend to
 
     def update(self, layer, k, v):
         """Store k, v (B, nh, T, hs) at positions [pos, pos+T); return all keys/values so far."""
@@ -106,10 +107,15 @@ class CausalSelfAttention(nn.Module):
             k, v = cache.update(self.layer, k, v)
         # Rows: the T new positions; columns: every position so far. Causal = row i sees columns <= start + i.
         mask = self.mask[start : start + T, : start + T]
+        padded = cache is not None and cache.pad is not None
+        if padded:  # (B, 1, T, S): hide padded keys; a padded row sees itself, so no softmax row is all -inf
+            mask = mask & ~cache.pad[:, None, None, : start + T]
+            i = torch.arange(T, device=x.device)
+            mask[:, :, i, start + i] = True
 
         if self.flash:
             dropout_p = self.dropout if self.training else 0.0
-            if start == 0:
+            if start == 0 and not padded:
                 y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dropout_p)
             else:  # is_causal assumes a square mask, which is wrong once cached positions are prepended
                 y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
@@ -229,17 +235,24 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True, eos_id=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None, use_cache=True, eos_id=None,
+                 pad=None):
         """temperature 0 = greedy. With use_cache, each step feeds only the newest token; once the context is
         full, the cache is rebuilt from the last block_size tokens (the same window the uncached path sees).
-        eos_id: stop early once every sequence has produced it."""
+        eos_id: stop early once every sequence has produced it. pad: (B, T) bool, True on left-padding of idx, so
+        prompts of different lengths share a batch; with RoPE (relative positions) that is exact."""
         bs, cache = self.cfg.block_size, None
+        assert pad is None or (use_cache and self.cfg.pos == "rope"), "padding needs the cache and RoPE"
         done = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
         for _ in range(max_new_tokens):
             if not use_cache:
                 logits, _ = self(idx[:, -bs:])
             elif cache is None or cache.pos >= bs:
                 cache = KVCache(self.cfg.n_layer, bs)
+                if pad is not None:
+                    window = pad[:, -bs:]
+                    cache.pad = torch.zeros(idx.size(0), bs, dtype=torch.bool, device=idx.device)
+                    cache.pad[:, : window.size(1)] = window
                 logits, _ = self(idx[:, -bs:], cache=cache)  # prefill
             else:
                 logits, _ = self(idx[:, -1:], cache=cache)
@@ -258,6 +271,8 @@ class GPT(nn.Module):
                     probs = torch.zeros_like(probs).scatter(-1, order, sorted_p)
                 next_id = torch.multinomial(probs, num_samples=1)  # renormalizes internally
             idx = torch.cat([idx, next_id], dim=1)
+            if pad is not None:
+                pad = torch.cat([pad, torch.zeros_like(next_id, dtype=torch.bool)], dim=1)
             if eos_id is not None:
                 done |= next_id[:, 0] == eos_id
                 if done.all():
