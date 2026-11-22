@@ -45,3 +45,17 @@ def test_fluency_nll_matches_unbatched_loss_and_skips_short_replies():
             x = torch.tensor([r])
             assert math.isclose(g, lm(x[:, :-1], x[:, 1:])[1].item(), rel_tol=1e-4)
     assert got[2] is None
+
+
+def test_fluency_penalty_is_a_hinge_above_the_margin():
+    from bpe import BPETokenizer
+    from dpo import fluency_nll, make_reward
+
+    torch.manual_seed(0)
+    lm = GPT(CFG).eval()
+    tok = BPETokenizer.train("ab" * 50, 260, ["<|endoftext|>"])
+    replies = [[1, 2, 3, 4, 5], [6, 7, 8]]
+    nll = fluency_nll(lm, replies, "cpu")
+    m = (nll[0] + nll[1]) / 2  # between the two losses: exactly one reply is penalised
+    got = make_reward(tok, "cpu", fluency_lm=lm, fluency_weight=10, fluency_margin=m)([([0], {}, r) for r in replies])
+    assert sorted(got) == [-10 * (max(nll) - m), 0.0]

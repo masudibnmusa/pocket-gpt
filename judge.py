@@ -6,7 +6,7 @@ The matching story is the one written for the request; the mismatched one depend
   - full     (summary + words + features): a random other story
   - features (e.g. "Give it a sad ending. Include some dialogue."): a story lacking a requested feature
   - summary  ("It should be about this: ..."): a random other story
-  - copy     (full request with a summary): the matching story with the request's phrases pasted in 2-3 times, the
+  - copy     (full request with a summary): the matching story with 2-3 stretches replaced by the request's phrases, the
              reward hack seen in iterative DPO, so "the summary's words appear" stops meaning "this story matches"
 Two judges are trained on disjoint halves of the data: A gives the DPO reward, B only evaluates, so the policy
 cannot score well on the evaluation by exploiting one judge's quirks.
@@ -48,11 +48,24 @@ def judge_request(fields, kind, rng):
 
 
 def paste_request(story, fields, rng):
-    """The story with the summary / required sentence pasted in at 2-3 random sentence ends (formatting kept)."""
+    """The story with 2-3 runs of its sentences replaced by the summary / required sentence. Each replaced run is about
+    as long as the phrase, so the copy is about as long as the story and the judge can't learn "longer = worse"."""
     phrases = [fields["Summary"]] + ([fields["Random sentence"]] if "Random sentence" in fields else [])
-    ends = [m.end() for m in re.finditer(r'[.!?]"? ', story)] or [len(story)]
-    for pos in sorted(rng.sample(ends, min(len(ends), rng.randint(2, 3))), reverse=True):
-        story = story[:pos] + rng.choice(phrases) + " " + story[pos:]
+    spans = [m.span() for m in re.finditer(r'\S[^.!?]*[.!?]+"?', story)]
+    if not spans:
+        return " ".join(phrases)
+    starts = sorted(rng.sample(range(len(spans)), min(len(spans), rng.randint(2, 3))))
+    windows, last = [], -1
+    for i in starts:
+        if i <= last:
+            continue
+        phrase, j = rng.choice(phrases), i
+        while j + 1 < len(spans) and j + 1 not in starts and spans[j][1] - spans[i][0] < len(phrase):
+            j += 1
+        windows.append((spans[i][0], spans[j][1], phrase))
+        last = j
+    for a, b, phrase in reversed(windows):  # right to left, so earlier offsets stay valid
+        story = story[:a] + phrase + story[b:]
     return story
 
 

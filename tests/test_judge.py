@@ -22,12 +22,14 @@ def test_feature_request_mentions_only_features():
     assert features_of({"Features": "Dialogue, Unknown"}) == ["Dialogue"]
 
 
-def test_paste_request_inserts_summary_between_sentences_and_keeps_the_story():
+def test_paste_request_swaps_sentences_for_the_summary_at_about_the_same_length():
+    from finetune import parse
     from judge import paste_request
 
-    story = 'Tom saw a dog.\nThe dog said, "Hi!" Tom smiled. They played all day.'
-    fields = {"Summary": "Tom meets a dog."}
-    for k in range(20):
+    story = ('Tom saw a dog.\nThe dog said, "Hi!" Tom smiled. They played all day. Then they ran home. '
+             "Mom made soup. Tom told her about the dog. She laughed. They ate together.")
+    fields = {"Summary": "Tom meets a dog and they play."}
+    for k in range(30):
         bad = paste_request(story, fields, random.Random(k))
-        assert bad.count("Tom meets a dog.") in (2, 3)
-        assert bad.replace("Tom meets a dog. ", "") == story  # only whole phrases added, newlines kept
+        assert bad != story and "Tom meets a dog and they play." in bad
+        assert 0.8 < len(bad) / len(story) < 1.25  # no length cue for the judge

@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/model-28M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-46_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-47_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. A 12M-parameter model trained for ~10 minutes on one RTX 5060 writes coherent children's stories.
 
@@ -110,6 +110,15 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python train.py --data data/tinystories_bpe4096_2300mb --out runs/ts_42m_1024 --steps 29000 \
     --n_layer 10 --n_head 9 --n_embd 576 --block_size 1024 --batch_size 16 --warmup 300 --eval_interval 1000 \
     --compile --induction --bias false --norm rmsnorm --mlp swiglu --pos rope
+
+# Chat, length-matched judges and hinge DPO on the 42M base (~1.5 h)
+.venv/bin/python multiturn.py --base runs/ts_42m_1024/ckpt.pt --out runs/ts_42m_chat
+.venv/bin/python judge.py --sft runs/ts_42m_chat/ckpt.pt --half 0 --out runs/judge_42m_a --batch_size 8 --steps 5000
+.venv/bin/python judge.py --sft runs/ts_42m_chat/ckpt.pt --half 1 --out runs/judge_42m_b --batch_size 8 --steps 5000
+.venv/bin/python dpo.py --sft runs/ts_42m_chat/ckpt.pt --reward judge --judge_rm runs/judge_42m_a/ckpt.pt \
+    --eval_judge runs/judge_42m_b/ckpt.pt --fluency_lm runs/ts_xl_1024/ckpt.pt \
+    --fluency_weight 10 --fluency_margin 1.8 --rounds 3 --out runs/ts_42m_dpo
+.venv/bin/python chat.py --ckpt runs/ts_42m_chat/ckpt.pt
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -479,8 +488,8 @@ Fluency no longer degrades (0.98 → 0.95, versus 0.98 → 1.37 before), and the
 It overcorrects into a different shortcut, **brevity**: replies shrink from 178 to ~100 tokens and use fewer of the
 required words. The saved pairs show where it starts. In round 1 the chosen reply is the shorter one 71% of the time
 (58% without the penalty), because long samples at temperature 1.0 are the ones that drift into high-loss text.
-Penalising only loss above the SFT level (a hinge) should keep the hack out without rewarding short replies.
-This run changed the judges, the penalty and the SFT model together, so it does not isolate which change did what.
+This run changed the judges, the penalty and the SFT model together, so it does not isolate which change did what;
+the next section does.
 
 ## A bigger compute-optimal model
 At 2x the compute of `ts_xl_1024` (1.2e17 FLOPs), the IsoFLOP fit (N_opt ∝ C^0.57) gives ~41M parameters. **ts_42m_1024**:
@@ -494,6 +503,36 @@ over the 546M-token corpus), ~100 min at 87k tok/s.
 
 2x the compute lowers the loss by 0.06 nats. The chat, judge and DPO models above are still built on the 28M base.
 
+## Where the brevity came from, and the 42M stack
+**Hinge penalty.** `--fluency_margin 1.8` penalises only loss above 1.8 (about the worst quarter of chat3's own
+samples at temperature 1.0; the median is 1.62, and longer samples score only ~0.1 worse). Rerunning the previous
+experiment with only this change (`ts_xl_dpo4`) made brevity *worse*: 101 → 58 → 87 tokens, fluency up to 1.51 in
+round 2, and the chosen reply was the shorter one in 74% of round-1 pairs. So the fluency penalty was not the main
+cause. It was the judges: a pasted-in summary always made the copy negative *longer*, so judges A2/B2 also learned
+"longer = worse".
+
+**Length-matched copy negatives.** `paste_request` now *replaces* runs of sentences with the summary, about as long
+as what it removes (median copy/original length 1.00). With these judges and the hinge, rebuilt on the 42M base
+(`ts_42m_chat` → `judge_42m_a/b` → `ts_42m_dpo`; fluency still scored by the 28M base, so it compares with the
+tables above):
+
+| Model | Words used | Dialogue | Judge B | Win vs SFT | Fluency | Length |
+|---|---|---|---|---|---|---|
+| 42M chat SFT | 43% | 93% | 8.6 | – | **1.055** | **185** |
+| round 1 | 48% | **97%** | 10.4 | 60% | 1.125 | 167 |
+| round 2 | **49%** | 95% | 10.9 | **63%** | 1.157 | 161 |
+| round 3 | **49%** | 97% | **11.5** | 62% | 1.174 | 154 |
+
+In round 1 the chosen reply is shorter in 57% of pairs, back to the 58% of the original judges. Replies stay near SFT
+length, and every round uses more of the required words. The final Tom-and-Anna story follows the request with dialogue
+and no copied phrases. The gains are smaller than the 28M runs' (win rate ~62%, not 72-89%), which is what you'd expect
+once the cheap shortcuts are closed. Fluency drifts up a little (1.06 → 1.17); the hinge allows that by design.
+
+The 42M chat model (chat val loss 1.147 vs 1.204, name recall 99%, words recall 94-99%) handles greetings it never saw
+*worse* than chat3: 12% vs 55% as the first message (40 conversations each). Your replayed chat is still answered correctly.
+The judges were trained at 8 pairs x 5000 steps instead of 16 x 2500, since a 42M judge at 16 pairs runs out of
+memory on 8 GB.
+
 ## Next
-Hinge fluency penalty (penalise only loss above the SFT level) → rebuild chat / judges / DPO on the 42M base →
-more varied greetings in the chat data.
+More varied greetings in the chat data (12% held-out first-message greetings on 42M) → a KL term instead of
+the hinge, to stop the slow fluency drift → judge the full conversation, not only story requests.

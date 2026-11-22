@@ -5,8 +5,9 @@ Each round:
 2. Reward each finished reply:
      --reward words : fraction of required words used (rule-based)
      --reward judge : learned judge A's score (fit to features + summary + words) + word_weight * word fraction
-   minus fluency_weight * the reply's per-token loss under the pretrained LM (a fluency penalty: reward-hacked replies
-   that pack the request's phrases into the story read worse to the base model).
+   minus fluency_weight * max(0, the reply's per-token loss under the pretrained LM - fluency_margin) (a fluency penalty:
+   reward-hacked replies that pack the request's phrases into the story read worse to the base model; the margin
+   leaves ordinary replies unpenalised, since a plain linear penalty also favours short replies).
    chosen = best reply, rejected = worst; requests whose replies all score the same are skipped.
 3. Train: loss = -log sigmoid(beta * [(log pi(c) - log ref(c)) - (log pi(r) - log ref(r))]), ref = the policy at the
    start of the round (round 1: the SFT model).
@@ -100,7 +101,7 @@ def fluency_nll(lm, replies, device, batch_size=16):
     return out
 
 
-def make_reward(tok, device, judge=None, word_weight=2.0, fluency_lm=None, fluency_weight=0.0):
+def make_reward(tok, device, judge=None, word_weight=2.0, fluency_lm=None, fluency_weight=0.0, fluency_margin=0.0):
     """reward(list of (prompt, fields, reply)) -> list of floats."""
     def reward(items):
         out = [word_fraction(tok, r, f) for _, f, r in items]
@@ -109,7 +110,7 @@ def make_reward(tok, device, judge=None, word_weight=2.0, fluency_lm=None, fluen
             out = [j + word_weight * w for j, w in zip(js, out)]
         if fluency_lm is not None and fluency_weight:
             nll = fluency_nll(fluency_lm, [r for _, _, r in items], device)
-            out = [o - fluency_weight * (n or 0.0) for o, n in zip(out, nll)]
+            out = [o - fluency_weight * max(0.0, (n or 0.0) - fluency_margin) for o, n in zip(out, nll)]
         return out
     return reward
 
@@ -192,6 +193,8 @@ def main():
     p.add_argument("--word_weight", type=float, default=2.0, help="reward = judge score + word_weight * word fraction")
     p.add_argument("--fluency_weight", type=float, default=0.0,
                    help="minus this x the reply's per-token loss under --fluency_lm (10 ~ the judge's spread)")
+    p.add_argument("--fluency_margin", type=float, default=0.0,
+                   help="penalise only loss above this (hinge); 0 = linear. ~75th percentile of the SFT's samples")
     p.add_argument("--out", default="runs/ts_xl_dpo_judge")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--n_requests", type=int, default=1500, help="fresh requests per round")
@@ -213,7 +216,8 @@ def main():
     eot = tok.special_ids[EOT]
     reward_judge = Judge.load(args.judge_rm, device) if args.reward == "judge" else None
     eval_judge = Judge.load(args.eval_judge, device) if args.eval_judge else None
-    reward = make_reward(tok, device, reward_judge, args.word_weight, fluency_lm, args.fluency_weight)
+    reward = make_reward(tok, device, reward_judge, args.word_weight, fluency_lm, args.fluency_weight,
+                         args.fluency_margin)
 
     # Requests: instruct *train* split, a fresh disjoint slice each round; eval: held-out val split.
     rng = random.Random(0)
