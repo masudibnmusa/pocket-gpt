@@ -73,3 +73,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# .venv/bin/python chat.py --ckpt runs/ts_xl_chat3/ckpt.pt
