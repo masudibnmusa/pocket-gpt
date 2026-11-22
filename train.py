@@ -17,7 +17,8 @@ for f in fields(GPTConfig):
         # bool("false") is True, so parse booleans explicitly
         typ = (lambda s: s.lower() in ("1", "true", "yes")) if f.type is bool else f.type
         p.add_argument(f"--{f.name}", type=typ, default=f.default, choices=CHOICES.get(f.name))
-p.add_argument("--batch_size", type=int, default=64)
+p.add_argument("--batch_size", type=int, default=64, help="sequences per micro-batch")
+p.add_argument("--grad_accum", type=int, default=1, help="micro-batches per step (step = batch_size x grad_accum)")
 p.add_argument("--steps", type=int, default=5000)
 p.add_argument("--lr", type=float, default=1e-3, help="peak learning rate, reached after warmup")
 p.add_argument("--min_lr", type=float, default=1e-4, help="learning rate at the end of cosine decay")
@@ -135,7 +136,8 @@ grad_norm = torch.tensor(float("nan"))
 for step in range(start_step, args.steps + 1):
     lr = get_lr(step, args.lr, args.min_lr, args.warmup, args.steps)
     if step % args.eval_interval == 0 or step == args.steps:
-        tok_s = args.eval_interval * args.batch_size * cfg.block_size / (time.time() - t0) if step > start_step else 0
+        tok_s = (args.eval_interval * args.batch_size * args.grad_accum * cfg.block_size / (time.time() - t0)
+                 if step > start_step else 0)
         rng = rng_state()  # taken before eval, so a resumed run replays this exact eval and the batches after it
         losses = estimate_loss()
         print(f"step {step:5d} | train {losses['train']:.4f} | val {losses['val']:.4f} | "
@@ -148,19 +150,20 @@ for step in range(start_step, args.steps + 1):
         break
     for g in opt.param_groups:
         g["lr"] = lr
-    x, y = get_batch(data["train"], args.batch_size, cfg.block_size, device)
-    if args.repeat_frac > 0:
-        # Random tokens tiled with a random period per row. A fixed period could be solved by a positional
-        # "look exactly P back" head (easy with RoPE); a random period forces content-based induction.
-        k, half = int(args.batch_size * args.repeat_frac), cfg.block_size // 2 + 1
-        seg = torch.randint(256, cfg.vocab_size - 1, (k, half), device=device)  # skip raw bytes and the last (EOT) id
-        period = torch.randint(8, half + 1, (k, 1), device=device)
-        rep = seg.gather(1, torch.arange(cfg.block_size + 1, device=device) % period)
-        x[:k], y[:k] = rep[:, :-1], rep[:, 1:]
-    with autocast:
-        _, loss = fwd(x, y)
     opt.zero_grad(set_to_none=True)
-    loss.backward()
+    for _ in range(args.grad_accum):
+        x, y = get_batch(data["train"], args.batch_size, cfg.block_size, device)
+        if args.repeat_frac > 0:
+            # Random tokens tiled with a random period per row. A fixed period could be solved by a positional
+            # "look exactly P back" head (easy with RoPE); a random period forces content-based induction.
+            k, half = int(args.batch_size * args.repeat_frac), cfg.block_size // 2 + 1
+            seg = torch.randint(256, cfg.vocab_size - 1, (k, half), device=device)  # skip raw bytes and the last (EOT) id
+            period = torch.randint(8, half + 1, (k, 1), device=device)
+            rep = seg.gather(1, torch.arange(cfg.block_size + 1, device=device) % period)
+            x[:k], y[:k] = rep[:, :-1], rep[:, 1:]
+        with autocast:
+            _, loss = fwd(x, y)
+        (loss / args.grad_accum).backward()  # mean over micro-batches = the loss of one big batch
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # returns the pre-clip norm
     opt.step()
 

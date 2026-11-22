@@ -14,10 +14,11 @@ A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2
 |---|---|---|---|---|
 | `ts_llama` | 12.2M | 256 | ~10 min | the first TinyStories model; already writes coherent stories |
 | `ts_xl_1024` | 27.8M | 1024 | ~45 min | longer context; base for the first chat, judge and DPO models |
-| `ts_42m_1024` | 42.2M | 1024 | ~100 min | the largest; base for the best chat model (`ts_42m_dpo2`) |
+| `ts_42m_1024` | 42.2M | 1024 | ~100 min | base for the chat models (`ts_42m_dpo2`, `ts_42m_dpo3`) |
+| `ts_62m_1024` | 62.1M | 1024 | ~3 h | the largest base model (val loss 1.068); no chat version yet |
 
 ## The model at a glance
-The largest model here, **pocket-gpt 42M**, is a small chat model that tells children's stories.
+The largest chat model here, **pocket-gpt 42M**, is a small chat model that tells children's stories.
 
 **Type.** A decoder-only transformer language model (the GPT family) with Llama-style parts: rotary position
 embeddings (RoPE), RMSNorm, a SwiGLU feed-forward, no bias terms, and an output layer tied to the token embedding.
@@ -66,8 +67,9 @@ answer questions about a story beyond names, the summary and the requested words
 
 | Checkpoint | Use it for |
 |---|---|
-| `runs/ts_42m_dpo2` | chatting and stories: the best all-round model |
-| `runs/ts_42m_chat2` | the same chat model before DPO |
+| `runs/ts_42m_dpo2` | stories: the most required words used (54%) |
+| `runs/ts_42m_dpo3` | chatting: same stories as its chat model, 100% on off-topic questions, closest to the chat model's fluency |
+| `runs/ts_42m_chat2` / `ts_42m_chat4` | the chat models before DPO |
 | `runs/ts_42m_1024` | plain text continuation: the pretrained base, no chat format |
 | `runs/ts_xl_chat3` | the earlier 28M chat model |
 
@@ -191,7 +193,16 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python dpo.py --sft runs/ts_42m_chat2/ckpt.pt --reward judge --judge_rm runs/judge_42m_conv_a/ckpt.pt \
     --eval_judge runs/judge_42m_conv_b/ckpt.pt --fluency_lm runs/ts_xl_1024/ckpt.pt --fluency_weight 0 \
     --kl_coef 1.0 --conv_frac 0.5 --batch_size 4 --steps 600 --rounds 3 --out runs/ts_42m_dpo2
-.venv/bin/python chat.py --ckpt runs/ts_42m_dpo2/ckpt.pt
+
+# Off-topic commands, KL 4 against a fixed SFT reference, then the 62M base (~4.5 h)
+.venv/bin/python multiturn.py --base runs/ts_42m_1024/ckpt.pt --out runs/ts_42m_chat4
+.venv/bin/python dpo.py --sft runs/ts_42m_chat4/ckpt.pt --reward judge --judge_rm runs/judge_42m_conv_a/ckpt.pt \
+    --eval_judge runs/judge_42m_conv_b/ckpt.pt --fluency_lm runs/ts_xl_1024/ckpt.pt --fluency_weight 0 \
+    --kl_coef 4 --ref sft --conv_frac 0.5 --batch_size 4 --steps 600 --rounds 3 --out runs/ts_42m_dpo3
+.venv/bin/python train.py --data data/tinystories_bpe4096_2300mb --out runs/ts_62m_1024 --steps 39400 \
+    --n_layer 12 --n_head 10 --n_embd 640 --block_size 1024 --batch_size 8 --grad_accum 2 --warmup 300 \
+    --eval_interval 1000 --compile --induction --bias false --norm rmsnorm --mlp swiglu --pos rope
+.venv/bin/python chat.py --ckpt runs/ts_42m_dpo3/ckpt.pt
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -654,6 +665,61 @@ in round 1 and then holds (KL to the SFT model stays at 0.02-0.04 per token), wo
 does not shrink. Round 1 drifts as much as before, so a weight of 1.0 is too weak to prevent that first step. Dialogue
 slips slightly (90% → 88%). This run changed the greetings, the judges, the prompt mix and the penalty together.
 
+## A stronger KL anchor, off-topic commands, and a 62M base
+**KL weight.** Round 1 of DPO on chat3, one round each with the per-round reference:
+
+| `--kl_coef` | Words used | Fluency | Win vs SFT | KL to SFT per token |
+|---|---|---|---|---|
+| SFT | 43% | 1.070 | – | – |
+| 1 | **49%** | 1.098 | **62%** | 0.030 |
+| 4 | 47% | 1.066 | 58.5% | 0.008 |
+| 16 | 44% | 1.064 | 52% | 0.0023 |
+
+A weight of 4 removes the fluency step and keeps most of the gain; 16 holds the model in place. `--ref sft` also fixes
+the DPO reference to the SFT model in every round (it was reset to the previous round's policy), so later rounds
+cannot drift step by step.
+
+**Off-topic.** chat3's only off-topic failure was "Translate cat into French.". It had been trained only on
+off-topic *questions*, so it refused nothing that wasn't phrased as one. Off-topic messages are now assembled from
+question and command templates ("Translate X into Y.", "Write code for ...", "Solve ..."). That made "howdy" look
+like gibberish, so short interjections ("sup", "ahoy", "hola", "heyyy", ...) joined the greeting words. Held-out
+small talk, 100 conversations each:
+
+| Model | First-message greeting | Greeting mid-chat | Off-topic | Gibberish | Plain story request |
+|---|---|---|---|---|---|
+| `ts_42m_chat2` | **81%** | 48% | 83% | 100% | 79% |
+| `ts_42m_dpo2` | **81%** | 63% | 83% | 100% | 79% |
+| `ts_42m_chat4` (commands + interjections) | **81%** | **69%** | **100%** | 100% | 78% |
+| `ts_42m_dpo3` (KL 4, SFT reference) | **81%** | 67% | **100%** | 99% | 78% |
+
+Name recall stays at 100% and words recall at 94-99%.
+
+**DPO with KL 4 and the SFT reference** (`ts_42m_dpo3`, on chat4):
+
+| Model | Words used | Dialogue | Judge B | Win vs SFT | Fluency | Length |
+|---|---|---|---|---|---|---|
+| `ts_42m_chat4` SFT | 44% | 91% | 3.34 | – | 1.072 | 181 |
+| round 1 | 45% | 91% | 4.12 | 53% | 1.073 | 177 |
+| round 2 | 44% | 89% | 3.75 | 47% | 1.083 | 179 |
+| round 3 | **47%** | **94%** | **4.28** | **56%** | 1.073 | 182 |
+
+Fluency no longer moves (1.072 → 1.073; KL to SFT 0.006-0.008 per token), and dialogue rises. The gains are small too:
+3 points of word use and a 56% win rate, against dpo2's 11 points and 70% at fluency 1.117. With this setup, drift
+and improvement come together. The anchor removes the fluency cost, and most of the gain goes with it.
+
+**62M pretraining.** 2x the 42M compute again: 12 layers, 10 heads, 640 dim (62.1M parameters), 645M tokens (39.4k
+steps x 16 x 1024 via `--grad_accum 2` x 8, since a batch of 16 runs out of memory; 1.18 passes over the corpus),
+~3 h at ~60k tok/s.
+
+| Model | Params | Tokens | Val loss | Val bpb | Peak induction score |
+|---|---|---|---|---|---|
+| ts_xl_1024 | 27.8M | 360M | 1.170 | 0.420 | 0.18 |
+| ts_42m_1024 | 42.2M | 475M | 1.111 | 0.399 | 0.19 |
+| **ts_62m_1024** | 62.1M | 645M | **1.068** | **0.384** | 0.22 |
+
+Another doubling lowers the loss by 0.04 nats (the previous one gave 0.06). The 62M checkpoint is 745 MB with the
+optimizer state. Its chat and DPO stack is not built yet.
+
 ## Next
-A larger KL weight (or anchoring the DPO reference to the SFT model) to stop the round-1 fluency step → off-topic
-detection back to 100% with the wider greetings → a bigger pretraining run.
+Chat, judges and DPO on the 62M base → KL 4 with a per-round reference, to see whether some of the gain comes back
+without the fluency step → more data: the 62M run already repeats 18% of the corpus.

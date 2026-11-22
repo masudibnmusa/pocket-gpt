@@ -50,17 +50,19 @@ def test_word_questions_refer_to_the_right_story():
 
 
 def test_small_talk_gets_fixed_replies_and_eval_phrasings_are_held_out():
-    from multiturn import EVAL_GREETINGS, EVAL_OFF_TOPIC, GREETING_REPLY, OFF_TOPIC, OFF_TOPIC_REPLY, greeting, small_talk
+    from multiturn import EVAL_GREETINGS, EVAL_OFF_TOPIC, GREETING_REPLY, OFF_TOPIC_REPLY, greeting, off_topic, small_talk
 
     rng = random.Random(0)
     talk = [small_talk(rng) for _ in range(300)]
     assert {a for _, a in talk} == {GREETING_REPLY, OFF_TOPIC_REPLY}
-    assert all(q not in OFF_TOPIC for q, a in talk if a == GREETING_REPLY)
     greets = {greeting(rng) for _ in range(5000)}
     assert len(greets) > 300  # assembled from parts, not a short list
     held_out = {e.lower().strip("!.") for e in EVAL_GREETINGS}
     assert not any(g.lower().strip("!.~:), ") in held_out for g in greets)
-    assert not set(EVAL_OFF_TOPIC) & set(OFF_TOPIC)
+    offs = {off_topic(rng) for _ in range(5000)}
+    assert len(offs) > 500 and not offs & set(EVAL_OFF_TOPIC)
+    assert sum(not o.endswith("?") for o in offs) > len(offs) / 3  # commands too, not only questions
+    assert not any(o.lower().startswith("translate") for o in offs)  # the held-out pattern
     convs = build_conversations(TOK, [ENTRY] * 200, 256, random.Random(0))
     replies = [TOK.decode([t for t, m in zip(ids, mask) if m]) for ids, mask, _ in convs]
     assert any(GREETING_REPLY in r for r in replies) and any(OFF_TOPIC_REPLY in r for r in replies)

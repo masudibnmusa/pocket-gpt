@@ -10,7 +10,7 @@ Each round:
    leaves ordinary replies unpenalised, since a plain linear penalty also favours short replies).
    chosen = best reply, rejected = worst; requests whose replies all score the same are skipped.
 3. Train: loss = -log sigmoid(beta * [(log pi(c) - log ref(c)) - (log pi(r) - log ref(r))]), ref = the policy at the
-   start of the round (round 1: the SFT model), + kl_coef * the per-token KL(pi || SFT) over the pair's reply tokens
+   start of the round (round 1: the SFT model) or, with --ref sft, the SFT model in every round, + kl_coef * the per-token KL(pi || SFT) over the pair's reply tokens
    (full next-token distributions), which anchors every round to the SFT model.
    --conv_frac of the requests are a random turn of a multi-turn conversation (story, small talk or a question
    about earlier stories) instead of a single story request; the judge sees the whole history.
@@ -222,6 +222,8 @@ def main():
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--eval_n", type=int, default=300)
     p.add_argument("--kl_coef", type=float, default=0.0, help="weight of the per-token KL(policy || SFT) in the loss")
+    p.add_argument("--ref", choices=["round", "sft"], default="round",
+                   help="DPO reference: the policy at the start of each round, or the SFT model in every round")
     p.add_argument("--conv_frac", type=float, default=0.0, help="share of requests that are a turn of a conversation")
     args = p.parse_args()
 
@@ -237,7 +239,7 @@ def main():
     eval_judge = Judge.load(args.eval_judge, device) if args.eval_judge else None
     reward = make_reward(tok, device, reward_judge, args.word_weight, fluency_lm, args.fluency_weight,
                          args.fluency_margin)
-    sft_model = copy.deepcopy(policy).requires_grad_(False) if args.kl_coef else None
+    sft_model = copy.deepcopy(policy).requires_grad_(False) if args.kl_coef or args.ref == "sft" else None
 
     # Requests: instruct *train* split, a fresh disjoint slice each round; eval: held-out val split.
     rng = random.Random(0)
@@ -275,7 +277,8 @@ def main():
             print(f"round {rnd}: sampled {args.k} x {len(requests)} replies in {time.time() - t0:.0f}s", flush=True)
         print(f"round {rnd}: {len(pairs)} pairs; mean reward chosen {sum(p[3] for p in pairs) / len(pairs):.2f}, "
               f"rejected {sum(p[4] for p in pairs) / len(pairs):.2f}", flush=True)
-        ref = copy.deepcopy(policy).requires_grad_(False)  # each round is anchored to where it started
+        # each round anchored to where it started, or every round to the SFT model
+        ref = sft_model if args.ref == "sft" else copy.deepcopy(policy).requires_grad_(False)
         dpo_train(policy, ref, pairs, eot, device, args.steps, args.batch_size, args.lr, args.beta, sft_model,
                   args.kl_coef)
         del ref

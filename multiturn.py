@@ -34,15 +34,39 @@ ANOTHER = ["Now tell me another story.", "Thanks! One more, please.", "Can you t
 # isn't a story question with a summary. The EVAL_ lists are held out to check it generalises beyond these phrasings.
 GREET_WORDS = ["hi", "hello", "hey", "hey there", "hi there", "hello there", "good morning", "good afternoon", "good day",
                "greetings", "hi friend", "hello friend", "morning", "heya", "hullo", "hi buddy", "hey friend",
-               "hello bot", "hi storyteller", "hey you", "hello again", "hi again"]
+               "hello bot", "hi storyteller", "hey you", "hello again", "hi again",
+               # short interjections, so a short unknown word that sounds friendly isn't taken for random letters
+               "sup", "ahoy", "aloha", "hola", "bonjour", "g'day", "heyo", "hi hi", "hello hello", "hey buddy",
+               "what's up", "wassup", "hellooo", "hii", "heyyy"]
 GREET_ENDS = ["", "!", ".", "!!", " :)", "~", ","]
 GREET_MORE = ["How are you?", "How are you doing?", "What's up?", "Nice to meet you.", "Are you there?",
               "How's it going?", "Anyone there?", "How is your day?"]
 GREETING_REPLY = "Hi! I can tell you a story. What should it be about?"
-OFF_TOPIC = ["What is the capital of France?", "What is 2 + 2?", "Can you help me with my homework?", "What time is it?",
-             "What's the weather like today?", "How do I cook pasta?", "Who won the game yesterday?",
-             "Can you write some code for me?", "What is your favorite color?", "Tell me a joke.", "Who is the president?",
-             "How far away is the moon?", "Can you do my math?", "What does DNA mean?"]
+# Off-topic messages are assembled too, half of them commands: with questions only, the model learned "question ->
+# off-topic, anything else -> greeting" and greeted "Translate cat into French." (the Translate pattern stays held out).
+OFF_TOPIC_QS = ["What is {thing}?", "Do you know {thing}?", "Tell me about {thing}.", "Why does {event}?",
+                "How do I {task}?", "Can you {task}?", "Could you please {task}?", "Who {did}?", "When did {event2}?",
+                "Where is {place}?", "How far is {place}?", "Is it true that {fact}?"]
+OFF_TOPIC_CMDS = ["{Task}.", "{Task}, please.", "Please {task}.", "I need you to {task}.", "Help me {task}.",
+                  "Explain {thing}.", "Calculate {a} times {b}.", "Solve {a} + {b}.", "Spell {word} backwards.",
+                  "Define the word {word}.", "Give me directions to {place}.", "List {things}.", "Book a flight to {place}.",
+                  "Set an alarm for {a} am.", "Convert {a} miles to kilometers.", "Recommend a good movie.",
+                  "Summarize today's news.", "Check my email.", "Turn on the lights.", "Write an email to my boss."]
+OFF_TOPIC_FILL = {
+    "thing": ["the capital of Spain", "gravity", "a black hole", "the stock market", "photosynthesis", "the speed of light",
+              "an atom", "the internet", "the weather today", "the time", "your favorite color", "quantum physics",
+              "the price of gold", "World War II", "how vaccines work", "the meaning of life"],
+    "task": ["fix my bike", "cook pasta", "do my homework", "write some code", "pay my bills", "lose weight",
+             "learn to drive", "fix my computer", "file my taxes", "change a tire", "make a website", "do my math"],
+    "did": ["wrote Hamlet", "painted the Mona Lisa", "won the game yesterday", "is the president", "discovered gravity",
+            "built the pyramids", "is the richest person"],
+    "event": ["the sky look blue", "ice float", "the sun rise", "my phone get hot", "bread rise"],
+    "event2": ["the war end", "people land on the moon", "the internet start", "dinosaurs live"],
+    "place": ["Paris", "the nearest bank", "Mount Everest", "the moon", "Tokyo", "the train station", "my house"],
+    "fact": ["fish can fly", "the earth is flat", "bananas are berries", "cats have nine lives"],
+    "word": ["apple", "house", "friend", "computer", "river", "happy"],
+    "things": ["the planets", "all the countries", "the colors of the rainbow", "the days of the week", "ten prime numbers"],
+}
 OFF_TOPIC_REPLY = "Sorry, I only know how to tell stories. What should the story be about?"
 EVAL_GREETINGS = ["hiya", "yo", "Good evening!", "howdy", "hey hey"]
 EVAL_OFF_TOPIC = ["What is the biggest planet?", "How many legs does a spider have?", "Translate cat into French.",
@@ -83,12 +107,24 @@ def greeting(rng):
             return msg
 
 
+def off_topic(rng):
+    """An off-topic question or command assembled from OFF_TOPIC_QS / OFF_TOPIC_CMDS; never one of EVAL_OFF_TOPIC."""
+    while True:
+        t = rng.choice(OFF_TOPIC_QS if rng.random() < 0.5 else OFF_TOPIC_CMDS)
+        fill = {k: rng.choice(v) for k, v in OFF_TOPIC_FILL.items()}
+        msg = t.format(**fill, Task=fill["task"][0].upper() + fill["task"][1:], a=rng.randint(2, 12), b=rng.randint(2, 99))
+        if rng.random() < 0.2:
+            msg = msg.lower().rstrip(".?")
+        if msg not in EVAL_OFF_TOPIC:
+            return msg
+
+
 def small_talk(rng):
-    """(message, fixed reply): a greeting, an off-topic question or random letters."""
+    """(message, fixed reply): a greeting, an off-topic question or command, or random letters."""
     r = rng.random()
-    if r < 0.4:
+    if r < 0.35:
         return greeting(rng), GREETING_REPLY
-    return (rng.choice(OFF_TOPIC) if r < 0.7 else gibberish(rng)), OFF_TOPIC_REPLY
+    return (off_topic(rng) if r < 0.8 else gibberish(rng)), OFF_TOPIC_REPLY
 
 
 def name_fact(story):
