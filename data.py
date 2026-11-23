@@ -3,10 +3,13 @@
 python data.py                                                        # Tiny Shakespeare, char   -> data/char
 python data.py --tokenizer bpe --vocab_size 1024                      # Tiny Shakespeare, BPE    -> data/bpe1024
 python data.py --dataset tinystories --tokenizer bpe --vocab_size 4096  # TinyStories (slice), BPE -> data/tinystories_bpe4096
+python data.py --add_v1 data/tinystories_bpe4096_2300mb   # + TinyStories V1 stories not in V2 -> <dir>_v1
 """
 import argparse
+import hashlib
 import json
 import os
+import shutil
 import time
 import urllib.request
 from itertools import chain
@@ -20,6 +23,7 @@ from bpe import BPETokenizer
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 TINYSTORIES_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-{}.txt"
+TINYSTORIES_V1_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-{}.txt"
 EOT = "<|endoftext|>"
 
 
@@ -167,6 +171,69 @@ def prepare(dataset="shakespeare", tokenizer="char", vocab_size=1024, train_mb=4
           f"{meta['train_bytes'] / meta['train_tokens']:.2f} bytes/token, {time.time() - t0:.0f}s total")
 
 
+def _story_key(story):
+    return hashlib.blake2b(" ".join(story.split()).encode(), digest_size=8).digest()  # whitespace-insensitive
+
+
+def new_stories(pieces, seen, piece_chars=1 << 20):
+    """Re-chunk the stories in `pieces` whose text is not in `seen` (adding each kept one, so repeats are dropped
+    too) into ~piece_chars pieces that end right after an EOT. Returns a generator; counts go in new_stories.stats."""
+    new_stories.stats = stats = {"kept": 0, "dropped": 0}
+
+    def gen():
+        buf, size = [], 0
+        for piece in pieces:
+            for story in piece.split(EOT):
+                if not story.strip():
+                    continue
+                k = _story_key(story)
+                if k in seen:
+                    stats["dropped"] += 1
+                    continue
+                seen.add(k)
+                stats["kept"] += 1
+                buf.append(story.strip("\n") + "\n" + EOT + "\n")
+                size += len(buf[-1])
+                if size >= piece_chars:
+                    yield "".join(buf)
+                    buf, size = [], 0
+        if buf:
+            yield "".join(buf)
+
+    return gen()
+
+
+def add_v1(data_dir):
+    """data_dir + TinyStories V1 train stories that are in neither V2 split, with data_dir's tokenizer and val set.
+    V1 includes GPT-3.5 stories; V2 is GPT-4 only, so the extra text is more of the same world, a bit noisier."""
+    out = data_dir.rstrip("/") + "_v1"
+    raw = os.path.join(DATA_DIR, "tinystories_v1_train.txt")
+    download(TINYSTORIES_V1_URL.format("train"), raw)
+    tok, t0 = load_tokenizer(data_dir), time.time()
+    meta = load_meta(data_dir)
+    seen = set()
+    for path in [os.path.join(DATA_DIR, "tinystories_train_2300mb.txt"), os.path.join(DATA_DIR, "tinystories_val.txt")]:
+        for _ in new_stories(_story_pieces(path), seen):
+            pass
+    print(f"{len(seen):,} V2 stories hashed in {time.time() - t0:.0f}s")
+    os.makedirs(out, exist_ok=True)
+    extra = new_stories(_story_pieces(raw), seen)
+    n_tok, n_bytes = encode_to_file(tok, extra, os.path.join(out, "extra.bin"))
+    print(f"V1: {new_stories.stats['kept']:,} new stories, {new_stories.stats['dropped']:,} already in V2; "
+          f"{n_tok:,} new tokens")
+    with open(os.path.join(out, "train.bin"), "wb") as f:
+        for part in [os.path.join(data_dir, "train.bin"), os.path.join(out, "extra.bin")]:
+            with open(part, "rb") as src:
+                shutil.copyfileobj(src, f, 1 << 24)
+    os.remove(os.path.join(out, "extra.bin"))
+    shutil.copy(os.path.join(data_dir, "val.bin"), os.path.join(out, "val.bin"))
+    meta["train_tokens"] += n_tok
+    meta["train_bytes"] += n_bytes
+    with open(os.path.join(out, "meta.json"), "w") as f:
+        json.dump(meta, f)
+    print(f"{out}: train {meta['train_tokens']:,} tokens, {time.time() - t0:.0f}s total")
+
+
 def load_meta(data_dir):
     with open(os.path.join(data_dir, "meta.json")) as f:
         return json.load(f)
@@ -201,5 +268,9 @@ if __name__ == "__main__":
     p.add_argument("--vocab_size", type=int, default=1024, help="BPE only; includes special tokens")
     p.add_argument("--train_mb", type=int, default=400, help="TinyStories: MB of the 2.2GB train file to use")
     p.add_argument("--bpe_train_mb", type=int, default=50, help="MB of train text to learn BPE merges from")
+    p.add_argument("--add_v1", metavar="DATA_DIR", help="extend a TinyStories BPE dir with deduplicated V1 stories")
     a = p.parse_args()
-    prepare(a.dataset, a.tokenizer, a.vocab_size, a.train_mb, a.bpe_train_mb)
+    if a.add_v1:
+        add_v1(a.add_v1)
+    else:
+        prepare(a.dataset, a.tokenizer, a.vocab_size, a.train_mb, a.bpe_train_mb)

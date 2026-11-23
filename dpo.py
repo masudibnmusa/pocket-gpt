@@ -174,6 +174,7 @@ def dpo_train(policy, ref, pairs, eot, device, steps, batch_size, lr, beta, kl_m
         if step % 50 == 0 or step == steps:
             print(f"  step {step:4d} | dpo loss {loss.item():.4f} | reward acc {(margin > 0).float().mean().item():.2f} | "
                   f"margin {margin.mean().item():.3f} | kl to sft {kl.item():.4f}", flush=True)
+    opt.zero_grad(set_to_none=True)  # free the grads before the next round samples: a 62M round 2 ran out of memory
     return policy.eval()
 
 
@@ -279,9 +280,16 @@ def main():
               f"rejected {sum(p[4] for p in pairs) / len(pairs):.2f}", flush=True)
         # each round anchored to where it started, or every round to the SFT model
         ref = sft_model if args.ref == "sft" else copy.deepcopy(policy).requires_grad_(False)
+        idle = [m for m in (fluency_lm, reward_judge, eval_judge) if m is not None]
+        for m in idle:  # not used while training; 62M DPO is at the edge of 8 GB
+            m.to("cpu")
+        torch.cuda.empty_cache()
         dpo_train(policy, ref, pairs, eot, device, args.steps, args.batch_size, args.lr, args.beta, sft_model,
                   args.kl_coef)
         del ref
+        torch.cuda.empty_cache()
+        for m in idle:
+            m.to(device)
         torch.save({"model": policy.state_dict(), "config": asdict(policy.cfg), "step": rnd * args.steps,
                     "args": {**vars(args), "data": data_dir, "extra_special_tokens": CHAT_TOKENS}},
                    os.path.join(args.out, "ckpt.pt"))

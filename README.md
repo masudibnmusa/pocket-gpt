@@ -6,7 +6,7 @@
 ![Model](https://img.shields.io/badge/model-42M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
-![Tests](https://img.shields.io/badge/tests-51_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-53_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
 
 A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2 and Llama-style variants), training loop, KV-cached sampling, and a GPT-2 weight-loading parity check. Models trained here, all on one RTX 5060:
 
@@ -15,7 +15,7 @@ A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2
 | `ts_llama` | 12.2M | 256 | ~10 min | the first TinyStories model; already writes coherent stories |
 | `ts_xl_1024` | 27.8M | 1024 | ~45 min | longer context; base for the first chat, judge and DPO models |
 | `ts_42m_1024` | 42.2M | 1024 | ~100 min | base for the chat models (`ts_42m_dpo2`, `ts_42m_dpo3`) |
-| `ts_62m_1024` | 62.1M | 1024 | ~3 h | the largest base model (val loss 1.068); no chat version yet |
+| `ts_62m_1024` | 62.1M | 1024 | ~3 h | the largest; base for `ts_62m_dpo` (val loss 1.068) |
 
 ## The model at a glance
 The largest chat model here, **pocket-gpt 42M**, is a small chat model that tells children's stories.
@@ -67,7 +67,8 @@ answer questions about a story beyond names, the summary and the requested words
 
 | Checkpoint | Use it for |
 |---|---|
-| `runs/ts_42m_dpo2` | stories: the most required words used (54%) |
+| `runs/ts_62m_dpo` | stories: the most required words (55%) at its chat model's fluency; weaker on first-message greetings (55%) |
+| `runs/ts_42m_dpo2` | stories on the 42M model: 54% of required words |
 | `runs/ts_42m_dpo3` | chatting: same stories as its chat model, 100% on off-topic questions, closest to the chat model's fluency |
 | `runs/ts_42m_chat2` / `ts_42m_chat4` | the chat models before DPO |
 | `runs/ts_42m_1024` | plain text continuation: the pretrained base, no chat format |
@@ -203,6 +204,18 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
     --n_layer 12 --n_head 10 --n_embd 640 --block_size 1024 --batch_size 8 --grad_accum 2 --warmup 300 \
     --eval_interval 1000 --compile --induction --bias false --norm rmsnorm --mlp swiglu --pos rope
 .venv/bin/python chat.py --ckpt runs/ts_42m_dpo3/ckpt.pt
+
+# Chat, judges and DPO (KL 4, per-round reference) on the 62M base; then the 62M base on deduplicated V1 + V2 (~7 h)
+.venv/bin/python data.py --add_v1 data/tinystories_bpe4096_2300mb
+.venv/bin/python multiturn.py --base runs/ts_62m_1024/ckpt.pt --out runs/ts_62m_chat
+.venv/bin/python judge.py --sft runs/ts_62m_chat/ckpt.pt --half 0 --out runs/judge_62m_a --batch_size 8 --steps 5000
+.venv/bin/python judge.py --sft runs/ts_62m_chat/ckpt.pt --half 1 --out runs/judge_62m_b --batch_size 8 --steps 5000
+.venv/bin/python dpo.py --sft runs/ts_62m_chat/ckpt.pt --reward judge --judge_rm runs/judge_62m_a/ckpt.pt \
+    --eval_judge runs/judge_62m_b/ckpt.pt --fluency_lm runs/ts_xl_1024/ckpt.pt --fluency_weight 0 \
+    --kl_coef 4 --ref round --conv_frac 0.5 --batch_size 4 --steps 600 --rounds 3 --out runs/ts_62m_dpo
+.venv/bin/python train.py --data data/tinystories_bpe4096_2300mb_v1 --out runs/ts_62m_v1 --steps 39400 \
+    --n_layer 12 --n_head 10 --n_embd 640 --block_size 1024 --batch_size 8 --grad_accum 2 --warmup 300 \
+    --eval_interval 1000 --compile --induction --bias false --norm rmsnorm --mlp swiglu --pos rope
 ```
 Every model field is a flag (`train.py --help`). A checkpoint is saved at every eval; continue a stopped run with
 `train.py --out <same dir> --resume` (keep the same `--steps` so the LR schedule matches). Training refuses to overwrite an existing run without `--resume`.
@@ -720,6 +733,47 @@ steps x 16 x 1024 via `--grad_accum 2` x 8, since a batch of 16 runs out of memo
 Another doubling lowers the loss by 0.04 nats (the previous one gave 0.06). The 62M checkpoint is 745 MB with the
 optimizer state. Its chat and DPO stack is not built yet.
 
+## The 62M chat stack, a per-round reference at KL 4, and more data
+**62M chat and judges.** `ts_62m_chat` reaches chat val loss 1.090 (42M: 1.147), name recall 99% and words recall
+92-98%. On held-out small talk it turns down 100% of off-topic messages and 98% of gibberish but answers only 55% of
+first-message greetings (chat4: 81%). The 62M judges score 96-97% on full requests, 91% on features, 94% on
+conversations and ≥99.5% on summaries and copies, a point or so above the 42M judges.
+
+**DPO at KL 4 with the per-round reference.** On 42M chat4 (`ts_42m_dpo4`, the same run as dpo3 except `--ref round`)
+and on 62M (`ts_62m_dpo`). Judge B scores come from different judges per model size, so compare them within a block:
+
+| Model | Words used | Dialogue | Judge B | Win vs SFT | Fluency | Length |
+|---|---|---|---|---|---|---|
+| `ts_42m_chat4` SFT | 44% | 91% | 3.34 | – | 1.072 | 181 |
+| `ts_42m_dpo3` (ref sft), round 3 | 47% | 94% | 4.28 | 56% | 1.073 | 182 |
+| `ts_42m_dpo4` (ref round), round 3 | **49%** | 89% | 3.80 | 55% | 1.072 | 187 |
+| `ts_62m_chat` SFT | 50% | 92% | 12.83 | – | 1.085 | 177 |
+| round 1 | 52% | 90% | 13.56 | 58% | 1.085 | 183 |
+| round 2 | 53% | 94% | 13.51 | 57% | 1.092 | 177 |
+| round 3 | **55%** | **94%** | 13.52 | 57% | **1.084** | 191 |
+
+At KL 4 a per-round reference brings back a little word use (47% → 49%) without moving fluency, but the win rate stays
+at ~55%, far from dpo2's 70%. In the chat checks it also costs something: dpo4 starts a new story for a plain "story
+please" only 48% of the time (chat4: 78%). The KL weight, not the reference, is what limits the gain. The 62M chat
+model already starts where 42M ends up after DPO (50% of the words), and DPO takes it to 55% at unchanged fluency,
+the best story model so far. After DPO it keeps 100% name recall, 94-96% words recall, 99% off-topic, 100%
+gibberish and 78% plain story requests, with 55% / 68% on greetings.
+
+**More data.** TinyStories V1 (`TinyStories-train.txt`, 2.12M stories, partly written by GPT-3.5) shares 1.26M stories
+with V2. `data.py --add_v1` hashes every V2 train and val story (whitespace-insensitive) and keeps only V1 stories
+seen in neither: 861k stories, 160M tokens, for 706M unique tokens in total. The same 62M run on it (`ts_62m_v1`)
+reads 0.91 of the corpus instead of 1.18 passes:
+
+| Model | Train data | Train loss | Val loss (V2 val) | Val bpb |
+|---|---|---|---|---|
+| ts_62m_1024 | V2, 546M tokens (18% seen twice) | 1.045 | **1.068** | **0.384** |
+| ts_62m_v1 | V2 + new V1, 706M tokens (none repeated) | 1.085 | 1.072 | 0.385 |
+
+The extra stories make validation slightly *worse*. The higher training loss shows the V1 stories are harder to
+predict, and the val set is V2 only, so the run spent 23% of its tokens on a nearby but different distribution.
+At 1.18 passes, repetition costs nothing measurable here; more data only helps once it is the same kind of text.
+
 ## Next
-Chat, judges and DPO on the 62M base → KL 4 with a per-round reference, to see whether some of the gain comes back
-without the fluency step → more data: the 62M run already repeats 18% of the corpus.
+Chat stack on 62M with greetings fixed (first-message greetings fell to 55%) → a KL weight between 1 and 4 to
+recover some of dpo2's gain → for pretraining, more GPT-4-quality stories rather than V1, or a bigger model for
+more than one epoch.
