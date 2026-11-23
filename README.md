@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/pytorch-2.15-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-bf16-76B900?style=flat-square&logo=nvidia&logoColor=white)
-![Model](https://img.shields.io/badge/model-42M_params-6366F1?style=flat-square)
+![Model](https://img.shields.io/badge/model-62M_params-6366F1?style=flat-square)
 ![Data](https://img.shields.io/badge/data-TinyStories_·_Tiny_Shakespeare-A21CAF?style=flat-square)
 ![GPT-2](https://img.shields.io/badge/GPT--2_parity-verified-0EA5E9?style=flat-square)
 ![Tests](https://img.shields.io/badge/tests-53_passing-3FB950?style=flat-square&logo=pytest&logoColor=white)
@@ -18,7 +18,7 @@ A GPT-style language model built from scratch: BPE tokenizer, transformer (GPT-2
 | `ts_62m_1024` | 62.1M | 1024 | ~3 h | the largest; base for `ts_62m_dpo` (val loss 1.068) |
 
 ## The model at a glance
-The largest chat model here, **pocket-gpt 42M**, is a small chat model that tells children's stories.
+The largest model here, **pocket-gpt 62M** (`ts_62m_dpo`), is a small chat model that tells children's stories.
 
 **Type.** A decoder-only transformer language model (the GPT family) with Llama-style parts: rotary position
 embeddings (RoPE), RMSNorm, a SwiGLU feed-forward, no bias terms, and an output layer tied to the token embedding.
@@ -28,36 +28,36 @@ It was pretrained from random weights, then fine-tuned for chat.
 
 | | |
 |---|---|
-| Total parameters | **42.2M** (39.8M in the transformer blocks + 2.4M token embedding) |
-| Layers | 10 |
-| Attention heads | 9 (64 dims each) |
-| Hidden size | 576 (SwiGLU inner size 1536) |
+| Total parameters | **62.1M** (59.5M in the transformer blocks + 2.6M token embedding) |
+| Layers | 12 |
+| Attention heads | 10 (64 dims each) |
+| Hidden size | 640 (SwiGLU inner size 1728) |
 | Context length | 1024 tokens (~4 KB of text) |
 | Vocabulary | 4,098: byte-level BPE with 4,096 tokens, plus `<\|user\|>` and `<\|assistant\|>` |
-| Checkpoint size | 169 MB (float32 weights; the pretraining checkpoint is 506 MB because it also stores the optimizer state) |
+| Checkpoint size | 248 MB (float32 weights; the pretraining checkpoint is 745 MB because it also stores the optimizer state) |
 
-**Training.** Three stages, ~3 hours in total on one RTX 5060 (8 GB):
-1. **Pretraining** on 475M tokens of [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
-   (one pass, compute-optimal for this budget). Validation loss 1.111 (0.399 bits per byte).
+**Training.** Three stages, ~4.5 hours in total on one RTX 5060 (8 GB):
+1. **Pretraining** on 645M tokens of [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
+   (1.18 passes, compute-optimal for this budget). Validation loss 1.068 (0.384 bits per byte).
 2. **Multi-turn chat fine-tuning** on conversations built from TinyStories-Instruct: story requests, follow-up
    questions, greetings and off-topic messages.
 3. **Preference tuning (DPO)**, 3 rounds on story requests and multi-turn conversation turns, rewarded by a learned
-   judge that reads the whole conversation, with a KL penalty that keeps it close to the chat model.
+   judge that reads the whole conversation, with a KL penalty (weight 4) that keeps it close to the chat model.
 
 **What it can do.**
 
-Measured on `ts_42m_dpo2`, the recommended checkpoint, with unseen phrasings for the chat rows:
+Measured on `ts_62m_dpo`, with unseen phrasings for the chat rows:
 
 | Ability | Result on held-out tests |
 |---|---|
-| Write a coherent children's story from a request | yes, ~170-190 tokens, simple English |
-| Include required words ("use the words moon and boat") | 54% of words (43% before DPO) |
-| Include dialogue when asked | 88% |
-| Remember a character's name later in the chat | 99% |
-| Recall which words you asked for, in a 2-story chat | 94-98% |
-| Turn down gibberish / off-topic questions | 100% / 83% |
-| Start a new story for a plain "story please" | 79% |
-| Reply to a greeting | 81% as the first message, 63% mid-chat |
+| Write a coherent children's story from a request | yes, ~180-190 tokens, simple English |
+| Include required words ("use the words moon and boat") | 55% of words (50% before DPO) |
+| Include dialogue when asked | 94% |
+| Remember a character's name later in the chat | 100% |
+| Recall which words you asked for, in a 2-story chat | 94-96% |
+| Turn down gibberish / off-topic messages | 100% / 99% |
+| Start a new story for a plain "story please" | 78% |
+| Reply to a greeting | 55% as the first message, 68% mid-chat ("hi", "hello", "howdy" work) |
 
 **What it cannot do.** It only knows the world of TinyStories: no general knowledge, maths, code or facts. It can't
 answer questions about a story beyond names, the summary and the requested words. Plots sometimes lose logic
@@ -67,43 +67,54 @@ answer questions about a story beyond names, the summary and the requested words
 
 | Checkpoint | Use it for |
 |---|---|
-| `runs/ts_62m_dpo` | stories: the most required words (55%) at its chat model's fluency; weaker on first-message greetings (55%) |
-| `runs/ts_42m_dpo2` | stories on the 42M model: 54% of required words |
-| `runs/ts_42m_dpo3` | chatting: same stories as its chat model, 100% on off-topic questions, closest to the chat model's fluency |
-| `runs/ts_42m_chat2` / `ts_42m_chat4` | the chat models before DPO |
-| `runs/ts_42m_1024` | plain text continuation: the pretrained base, no chat format |
+| `runs/ts_62m_dpo` | chatting and stories: the best all-round model |
+| `runs/ts_42m_dpo3` | greetings: 81% of unseen first-message greetings, 100% off-topic; smaller and less precise on stories (47% of words) |
+| `runs/ts_42m_dpo2` | the best 42M story model (54% of words); weaker on off-topic messages (83%) |
+| `runs/ts_62m_chat` / `ts_42m_chat4` | the chat models before DPO |
+| `runs/ts_62m_1024` | plain text continuation: the pretrained base, no chat format |
 | `runs/ts_xl_chat3` | the earlier 28M chat model |
 
 ```bash
-.venv/bin/python chat.py --ckpt runs/ts_42m_dpo2/ckpt.pt
+.venv/bin/python chat.py --ckpt runs/ts_62m_dpo/ckpt.pt
 ```
 
 ## Project structure
 ```text
 pocket-gpt/
 ├── bpe.py               # Byte-level BPE from scratch: GPT-4 regex pre-split, incremental merge training, special tokens
-├── data.py              # Download corpus (Tiny Shakespeare / TinyStories), tokenize -> data/<name>/, random-window batches
+├── data.py              # Download corpus (Tiny Shakespeare / TinyStories), tokenize -> data/<name>/, random-window batches,
+│                        #   --add_v1: extend with TinyStories V1 stories not already in V2 (hash dedupe)
 ├── model.py             # Decoder-only transformer: GPT-2 defaults, flags for RoPE / RMSNorm / SwiGLU / no-bias,
-│                        #   hand-written or SDPA (Flash) attention, KV cache, temperature / top-k / top-p sampling
-├── train.py             # AdamW param groups + warmup/cosine, grad clipping, bf16, torch.compile, eval (loss + bits/byte), checkpoint/resume
+│                        #   hand-written or SDPA (Flash) attention, KV cache, temperature / top-k / top-p sampling,
+│                        #   left-padded batched generation (padding mask carried in the KV cache)
+├── train.py             # AdamW param groups + warmup/cosine, grad clipping, grad accumulation, bf16, torch.compile,
+│                        #   eval (loss + bits/byte), checkpoint/resume
 ├── sample.py            # Generate text from a checkpoint with its own tokenizer (KV cache on by default)
 ├── gpt2.py              # Load OpenAI GPT-2 (124M) weights from Hugging Face into model.GPT
 ├── scaling.py           # Scaling sweep: 5 model sizes, same token budget, power-law fit L(N) = c + a·N^-alpha
 ├── isoflop.py           # Compute-optimal (Chinchilla IsoFLOP) sweep: 3 budgets x 5 sizes, optimal N and D vs compute
 ├── analysis.py          # Attention maps, induction / previous-token heads (also over training), embeddings + PCA
 ├── finetune.py          # SFT on TinyStories-Instruct: plain-text or chat format (<|user|>/<|assistant|> tokens)
-├── multiturn.py         # Multi-turn chat SFT: follow-ups answerable only from earlier turns + name-recall eval
-├── judge.py             # Learned judge (reward model): does a story fit its request? Features, summary, words
-├── dpo.py               # DPO preference tuning, multi-round on-policy; rule-based or learned-judge reward
+├── multiturn.py         # Multi-turn chat SFT: follow-ups answerable only from earlier turns, greetings / off-topic /
+│                        #   gibberish / casual requests built from parts; name, words and small-talk evals
+├── judge.py             # Learned judge (reward model): does a reply fit its request or conversation? Full, features,
+│                        #   summary, copy (pasted-in request) and whole-conversation pairs
+├── dpo.py               # DPO preference tuning, multi-round on-policy; rule-based or learned-judge reward, fluency
+│                        #   penalty, KL to the SFT model, per-round or fixed reference, prompts from inside conversations
 ├── chat.py              # Multi-turn terminal chat (history kept until the context is full, /reset)
 ├── tests/
 │   ├── test_model.py    # per config (GPT-2/Llama x manual/SDPA): initial loss, no future leak, overfit one batch,
-│   │                    #   manual == SDPA attention, KV cache == full forward, cached == uncached generation, top-p
+│   │                    #   manual == SDPA attention, KV cache == full forward, cached == uncached generation, top-p,
+│   │                    #   left-padded generation == unpadded
 │   ├── test_bpe.py      # first merge, unicode round-trip, compression, reload, incremental == naive training, specials
 │   ├── test_finetune.py # instruct parsing, response-only loss mask, chat requests name every word, grow_vocab
-│   ├── test_multiturn.py # name facts, per-turn loss masks, conversations fit the context
-│   ├── test_dpo.py      # sequence log-prob counts only the reply, DPO loss = ln 2 when policy == reference
-│   ├── test_judge.py    # judge scores ignore padding/batch mates, feature-only requests
+│   ├── test_multiturn.py # name facts, per-turn loss masks, conversations fit the context, word questions pick the right
+│   │                    #   story, small-talk replies + held-out eval phrasings, turn metadata, casual requests
+│   ├── test_dpo.py      # sequence log-prob counts only the reply, DPO loss = ln 2 when policy == reference,
+│   │                    #   fluency loss, hinge penalty, token KL
+│   ├── test_judge.py    # judge scores ignore padding/batch mates, feature-only requests, length-matched copy
+│   │                    #   negatives, conversation pairs
+│   ├── test_data.py     # V1 dedupe drops seen and repeated stories, pieces end at a story boundary
 │   └── test_gpt2_parity.py  # our logits == Hugging Face GPT-2 logits (skipped without transformers)
 ├── assets/banners/      # README banners (PNG) + their HTML sources
 ├── assets/analysis/     # plots written by scaling.py and analysis.py
@@ -679,11 +690,11 @@ does not shrink. Round 1 drifts as much as before, so a weight of 1.0 is too wea
 slips slightly (90% → 88%). This run changed the greetings, the judges, the prompt mix and the penalty together.
 
 ## A stronger KL anchor, off-topic commands, and a 62M base
-**KL weight.** Round 1 of DPO on chat3, one round each with the per-round reference:
+**KL weight.** One round of DPO each on `ts_42m_chat3` (chat2 plus the off-topic commands below):
 
 | `--kl_coef` | Words used | Fluency | Win vs SFT | KL to SFT per token |
 |---|---|---|---|---|
-| SFT | 43% | 1.070 | – | – |
+| `ts_42m_chat3` SFT | 43% | 1.070 | – | – |
 | 1 | **49%** | 1.098 | **62%** | 0.030 |
 | 4 | 47% | 1.066 | 58.5% | 0.008 |
 | 16 | 44% | 1.064 | 52% | 0.0023 |
@@ -692,20 +703,22 @@ A weight of 4 removes the fluency step and keeps most of the gain; 16 holds the 
 the DPO reference to the SFT model in every round (it was reset to the previous round's policy), so later rounds
 cannot drift step by step.
 
-**Off-topic.** chat3's only off-topic failure was "Translate cat into French.". It had been trained only on
-off-topic *questions*, so it refused nothing that wasn't phrased as one. Off-topic messages are now assembled from
-question and command templates ("Translate X into Y.", "Write code for ...", "Solve ..."). That made "howdy" look
-like gibberish, so short interjections ("sup", "ahoy", "hola", "heyyy", ...) joined the greeting words. Held-out
-small talk, 100 conversations each:
+**Off-topic.** All of `ts_42m_chat2`'s off-topic misses (83%) were one held-out message, "Translate cat into
+French.". Almost all its off-topic examples were questions, so it learned "question → off-topic, anything else →
+greeting". Off-topic messages are now assembled from question and command templates ("Calculate 5 times 25.",
+"Help me cook pasta.", ...; the "Translate ..." pattern stays held out) in `ts_42m_chat3`. That made unseen short
+greetings like "howdy" look like gibberish, so short interjections ("sup", "ahoy", "hola", "heyyy", ...) joined the
+greeting words in `ts_42m_chat4`. Held-out small talk, 100 conversations each:
 
 | Model | First-message greeting | Greeting mid-chat | Off-topic | Gibberish | Plain story request |
 |---|---|---|---|---|---|
 | `ts_42m_chat2` | **81%** | 48% | 83% | 100% | 79% |
 | `ts_42m_dpo2` | **81%** | 63% | 83% | 100% | 79% |
+| `ts_42m_chat3` (commands) | 55% | 62% | **100%** | 100% | 78% |
 | `ts_42m_chat4` (commands + interjections) | **81%** | **69%** | **100%** | 100% | 78% |
 | `ts_42m_dpo3` (KL 4, SFT reference) | **81%** | 67% | **100%** | 99% | 78% |
 
-Name recall stays at 100% and words recall at 94-99%.
+Name recall stays at 98-100% and words recall at 91-99%.
 
 **DPO with KL 4 and the SFT reference** (`ts_42m_dpo3`, on chat4):
 
@@ -731,7 +744,7 @@ steps x 16 x 1024 via `--grad_accum 2` x 8, since a batch of 16 runs out of memo
 | **ts_62m_1024** | 62.1M | 645M | **1.068** | **0.384** | 0.22 |
 
 Another doubling lowers the loss by 0.04 nats (the previous one gave 0.06). The 62M checkpoint is 745 MB with the
-optimizer state. Its chat and DPO stack is not built yet.
+optimizer state. Its chat, judges and DPO follow in the next section.
 
 ## The 62M chat stack, a per-round reference at KL 4, and more data
 **62M chat and judges.** `ts_62m_chat` reaches chat val loss 1.090 (42M: 1.147), name recall 99% and words recall
